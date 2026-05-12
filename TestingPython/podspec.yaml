@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: synthetic-load
+  labels:
+    app: synthetic-load
+spec:
+  containers:
+  - name: load
+    image: jp36/synthetic-load:latest
+    imagePullPolicy: Always
+    ports:
+    - name: metrics
+      containerPort: 8000
+    env:
+    - name: CPU_TARGET_PCT
+      value: "30"
+    - name: RAM_TARGET_MB
+      value: "256"
+    - name: NET_TARGET_MBPS
+      value: "10"
+    - name: NET_TARGET_HOST
+      value: "iperf-server"
+    - name: NET_TARGET_PORT
+      value: "5201"
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: synthetic-load
+  labels:
+    app: synthetic-load
+spec:
+  selector:
+    app: synthetic-load
+  ports:
+  - name: metrics
+    port: 8000
+    targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: synthetic-load
+  labels:
+    # kube-prometheus-stack's Prometheus selects ServiceMonitors with this label by default.
+    release: kps
+spec:
+  selector:
+    matchLabels:
+      app: synthetic-load
+  endpoints:
+  - port: metrics
+    interval: 15s
