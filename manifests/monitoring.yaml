@@ -1,0 +1,29 @@
+# ============================================================================
+# Prometheus + Grafana glue
+# ============================================================================
+# Two ways to scrape the worker:
+#
+# 1. Stock Prometheus (kube-prometheus-stack, bitnami chart, etc.):
+#    the worker pod is already annotated with prometheus.io/scrape=true
+#    in emulator.yaml — most default configs pick that up automatically.
+#
+# 2. Prometheus Operator: apply the PodMonitor below. It tells the operator
+#    to scrape every pod labeled app=worker on port 8080 path /metrics.
+# ============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: worker
+  labels:
+    # match whatever podMonitorSelector your Prometheus CR uses;
+    # kube-prometheus-stack defaults to release: <helm-release-name>
+    release: kps
+spec:
+  selector:
+    matchLabels:
+      app: worker
+  podMetricsEndpoints:
+    - port: ""              # unnamed container port — match by number below
+      targetPort: 8080
+      path: /metrics
+      interval: 5s

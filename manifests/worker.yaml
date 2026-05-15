@@ -1,0 +1,51 @@
+# ============================================================================
+# Worker pod + service
+# ============================================================================
+# The worker emulates resource usage (CPU / RAM / network) based on coefficients
+# it receives. It's fronted by a ClusterIP Service so the controller can address
+# it via the stable DNS name `worker-service:8080`.
+#
+# resources.limits enforce the *Kubernetes-level* caps that the project
+# objectives mention ("CPU caps and resource quotas to emulate heterogeneous
+# devices"). The worker also self-imposes usage via its linear functions —
+# the two layers compose naturally.
+# ============================================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: worker
+  labels:
+    app: worker
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  containers:
+    - name: worker
+      image: jp36/emulator-worker:latest
+      imagePullPolicy: Always           # pull from Docker Hub
+      ports:
+        - containerPort: 8080
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "64Mi"
+        limits:
+          cpu: "2000m"                  # 2 cores max — emulates "edge node"
+          memory: "1Gi"
+      readinessProbe:
+        httpGet: { path: /healthz, port: 8080 }
+        periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-service
+spec:
+  selector:
+    app: worker
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
