@@ -1,15 +1,32 @@
 # ============================================================================
-# Worker pod + service
+# Worker pod + service + config
 # ============================================================================
 # The worker emulates resource usage (CPU / RAM / network) based on coefficients
-# it receives. It's fronted by a ClusterIP Service so the controller can address
-# it via the stable DNS name `worker-service:8080`.
+# it receives. Instead of being pushed at over HTTP, it reads its desired
+# behaviour from a JSON file projected into the pod from the `worker-config`
+# ConfigMap. The worker uses `watchdog` to react to file changes, so editing
+# the ConfigMap re-configures the emulation.
 #
 # resources.limits enforce the *Kubernetes-level* caps that the project
 # objectives mention ("CPU caps and resource quotas to emulate heterogeneous
 # devices"). The worker also self-imposes usage via its linear functions —
 # the two layers compose naturally.
 # ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: worker-config
+data:
+  # Default: zero load. Edit this (via kubectl edit / the controller) to drive
+  # the worker. The worker's startup applies this as soon as the pod boots.
+  config.json: |
+    {
+      "x": 0,
+      "cpu": { "a": 0, "b": 0 },
+      "ram": { "a": 0, "b": 0 },
+      "net": { "a": 0, "b": 0 }
+    }
+---
 apiVersion: v1
 kind: Pod
 metadata:
@@ -37,6 +54,14 @@ spec:
       readinessProbe:
         httpGet: { path: /healthz, port: 8080 }
         periodSeconds: 2
+      volumeMounts:
+        - name: config
+          mountPath: /etc/emulator
+          readOnly: true
+  volumes:
+    - name: config
+      configMap:
+        name: worker-config
 ---
 apiVersion: v1
 kind: Service

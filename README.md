@@ -11,25 +11,29 @@ A two-pod prototype for the EEECS summer research project
             ▼
    ┌──────────────────────┐
    │   controller pod     │  (controller-service, NodePort 30081)
-   │  validates + routes  │
+   │  validates + writes  │
+   │   worker-config CM   │
    └──────────┬───────────┘
-              │  forwards JSON
+              │  PATCH ConfigMap via k8s API
               ▼
-   ┌──────────────────────┐
-   │     worker pod       │  (worker-service, ClusterIP 8080)
-   │  applies a·x + b for │
-   │  CPU, RAM, network   │
-   │  and emulates the    │
-   │  resulting load      │
-   └──────────────────────┘
+   ┌──────────────────────┐         ┌─────────────────────┐
+   │  worker-config CM    │ ──mount─▶│     worker pod      │
+   │  data.config.json    │          │  watchdog notices   │
+   └──────────────────────┘          │  the file changed,  │
+                                     │  re-runs configure()│
+                                     └─────────────────────┘
 ```
 
-* **Worker** — Computes `cpu_percent = cpu.a·x + cpu.b`, etc., then actually
-  burns CPU, allocates RAM, and pushes loopback network traffic at the
-  computed rates.
+* **Worker** — Reads `/etc/emulator/config.json` (sourced from the
+  `worker-config` ConfigMap) and watches it with `watchdog`. On every
+  change it computes `cpu_millicores = cpu.a·x + cpu.b`, etc., then
+  actually burns CPU, allocates RAM, and pushes loopback network traffic
+  at the computed rates.
 * **Controller** — Front door. Accepts the same JSON, validates it, and
-  forwards to the worker via the worker's Kubernetes Service DNS name
-  (`worker-service:8080`).
+  writes it to the `worker-config` ConfigMap via the Kubernetes API
+  (using its ServiceAccount). It no longer talks to the worker for
+  reconfigure — kubelet propagates the new ConfigMap contents into the
+  worker's mounted file, and the worker reacts.
 
 ## Request shape
 
@@ -135,12 +139,14 @@ microk8s kubectl get pods,svc
 
 You should see:
 
-| Name                         | Kind    | Notes                |
-|------------------------------|---------|----------------------|
-| `worker`                     | Pod     | the workload         |
-| `controller`                 | Pod     | the front door       |
-| `worker-service`             | Service | ClusterIP, port 8080 |
-| `controller-service`         | Service | NodePort, port 30081 |
+| Name                         | Kind          | Notes                              |
+|------------------------------|---------------|------------------------------------|
+| `worker`                     | Pod           | the workload                       |
+| `controller`                 | Pod           | the front door                     |
+| `worker-config`              | ConfigMap     | desired emulator state             |
+| `worker-service`             | Service       | ClusterIP, port 8080               |
+| `controller-service`         | Service       | NodePort, port 30081               |
+| `controller-sa`              | ServiceAccount| identity for patching the ConfigMap|
 
 ---
 
@@ -178,8 +184,9 @@ curl http://192.168.2.2:30081/status
 
 ### Reconfigure with a new input
 
-Just POST again — the worker stops the old emulation before starting the
-new one.
+Just POST again — the controller patches the ConfigMap, kubelet
+refreshes the mounted file, and the worker's filesystem watcher stops
+the old emulation before starting the new one.
 
 ```bash
 curl -X POST http://192.168.2.2:30081/configure \
@@ -187,11 +194,29 @@ curl -X POST http://192.168.2.2:30081/configure \
   -d '{"x":10,"cpu":{"a":20,"b":50},"ram":{"a":1,"b":10},"net":{"a":0.05,"b":0}}'
 ```
 
+You can also reconfigure declaratively, bypassing the controller entirely:
+
+```bash
+microk8s kubectl edit configmap worker-config
+# ... or:
+microk8s kubectl create configmap worker-config \
+  --from-file=config.json=./config.json --dry-run=client -o yaml \
+  | microk8s kubectl apply -f -
+```
+
+Note: kubelet refreshes a mounted ConfigMap on its own schedule — typically
+within ~60 seconds. For instant propagation, delete the worker pod and let
+it come back, or use the controller's `/configure` (the worker still
+re-reads the file as soon as the projected mount swaps).
+
 ### Stop the emulation
 
 ```bash
 curl -X POST http://192.168.2.2:30081/stop
 ```
+
+This writes a zero-load config into the ConfigMap; the worker tears down
+the running stressors when the file changes.
 
 ---
 
@@ -230,9 +255,11 @@ there — the whole point of using this unit.
 | POST   | `/stop`      | —                               | clear emulation              |
 | GET    | `/healthz`   | —                               | liveness                     |
 
-### Worker (ClusterIP, port 8080 — usually accessed via controller)
+### Worker (ClusterIP, port 8080)
 
-Same endpoints. Reachable from inside the cluster as
+The worker is configured exclusively via the mounted ConfigMap file, so
+it only exposes read-only endpoints: `GET /status`, `GET /healthz`,
+`GET /metrics`. Reachable from inside the cluster as
 `http://worker-service:8080`. Useful for debugging:
 
 ```bash
@@ -288,21 +315,26 @@ in the manifest, or lower your `ram.a`/`ram.b` values.
 
 ## Local sanity check (no Kubernetes)
 
-For fast iteration on the application logic:
+The worker no longer accepts HTTP `/configure` — it only watches a file.
+For local iteration, write to that file directly:
 
 ```bash
-# terminal 1 — worker
-python3 worker/worker.py
+# terminal 1 — worker (points at a local config file)
+mkdir -p /tmp/emulator
+echo '{"x":0,"cpu":{"a":0,"b":0},"ram":{"a":0,"b":0},"net":{"a":0,"b":0}}' \
+  > /tmp/emulator/config.json
+CONFIG_PATH=/tmp/emulator/config.json python3 worker/worker.py
 
-# terminal 2 — controller, pointed at local worker
-WORKER_URL=http://127.0.0.1:8080 python3 controller/controller.py
-
-# terminal 3 — drive it
-curl -X POST http://127.0.0.1:8081/configure \
-  -H 'Content-Type: application/json' \
-  -d '{"x":10,"cpu":{"a":20,"b":50},"ram":{"a":1,"b":10},"net":{"a":0.05,"b":0}}'
-curl http://127.0.0.1:8081/status
+# terminal 2 — drive it by overwriting the file
+cat > /tmp/emulator/config.json <<'EOF'
+{"x":10,"cpu":{"a":20,"b":50},"ram":{"a":1,"b":10},"net":{"a":0.05,"b":0}}
+EOF
+curl http://127.0.0.1:8080/status
 ```
+
+The controller is not runnable outside the cluster — it needs the
+in-pod ServiceAccount token + CA at `/var/run/secrets/...` to reach the
+Kubernetes API. Test it inside MicroK8s instead.
 
 ---
 

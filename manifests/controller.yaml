@@ -1,10 +1,41 @@
 # ============================================================================
-# Controller pod + service
+# Controller pod + service + RBAC
 # ============================================================================
 # The controller is the public entry point. Exposed as NodePort here so you
 # can hit it from your laptop while developing; switch to ClusterIP/Ingress
 # in production.
+#
+# The controller writes desired emulator state into the `worker-config`
+# ConfigMap. That requires `get`/`patch` permission on that specific
+# ConfigMap, granted via the ServiceAccount + Role + RoleBinding below.
 # ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller-sa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: controller-configmap-writer
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["worker-config"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: controller-configmap-writer
+subjects:
+  - kind: ServiceAccount
+    name: controller-sa
+roleRef:
+  kind: Role
+  name: controller-configmap-writer
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: v1
 kind: Pod
 metadata:
@@ -12,6 +43,7 @@ metadata:
   labels:
     app: controller
 spec:
+  serviceAccountName: controller-sa
   containers:
     - name: controller
       image: jp36/emulator-controller:latest
@@ -21,6 +53,8 @@ spec:
       env:
         - name: WORKER_URL
           value: "http://worker-service:8080"
+        - name: CONFIGMAP_NAME
+          value: "worker-config"
       readinessProbe:
         httpGet: { path: /healthz, port: 8081 }
         periodSeconds: 2

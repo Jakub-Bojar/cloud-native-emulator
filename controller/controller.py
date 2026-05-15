@@ -2,24 +2,28 @@
 Controller pod.
 
 Acts as the front door for the emulation. The user (or an experiment
-driver) POSTs JSON to this pod describing how the worker should behave;
-this pod forwards the request to the worker through its Kubernetes
-Service DNS name.
+driver) POSTs JSON to this pod describing how the worker should behave.
+Instead of forwarding directly to the worker over HTTP, the controller
+writes the JSON into the `worker-config` ConfigMap via the Kubernetes
+API; kubelet then refreshes the mounted file inside the worker pod, and
+the worker reacts via its filesystem watcher.
 
 Separating "what to do" (controller) from "how to do it" (worker) lets
-many workers be addressed through a single stable endpoint, and lets
-the experiment driver run from anywhere on the cluster network.
+many workers be addressed through a single declarative resource, and
+makes the configuration trail visible to anything that watches the
+cluster (kubectl, GitOps tooling, audit logs, etc).
 
 Endpoints
 ---------
-POST /configure   forward JSON to worker's /configure
-GET  /status      fetch worker's current state
-POST /stop        tell worker to clear emulation
+POST /configure   validate + write JSON into worker-config ConfigMap
+GET  /status      proxy worker's current state (still over HTTP)
+POST /stop        write zero-load config into worker-config ConfigMap
 GET  /healthz     liveness for k8s
 """
 
 import json
 import os
+import ssl
 import logging
 import urllib.request
 import urllib.error
@@ -31,16 +35,68 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Worker is addressed by its k8s Service DNS name. In-cluster this resolves
-# automatically. For local testing override with WORKER_URL.
 WORKER_URL = os.environ.get("WORKER_URL", "http://worker-service:8080")
+CONFIGMAP_NAME = os.environ.get("CONFIGMAP_NAME", "worker-config")
+CONFIGMAP_KEY = os.environ.get("CONFIGMAP_KEY", "config.json")
+
+SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+TOKEN_PATH = f"{SA_DIR}/token"
+CA_PATH = f"{SA_DIR}/ca.crt"
+NS_PATH = f"{SA_DIR}/namespace"
+
+ZERO_CONFIG = {
+    "x": 0,
+    "cpu": {"a": 0, "b": 0},
+    "ram": {"a": 0, "b": 0},
+    "net": {"a": 0, "b": 0},
+}
 
 
-def forwardToWorker(method: str, path: str, body: bytes | None = None):
-    url = f"{WORKER_URL}{path}"
-    req = urllib.request.Request(url, data=body, method=method)
-    if body is not None:
-        req.add_header("Content-Type", "application/json")
+def _read_sa_file(path: str) -> str:
+    with open(path, "r") as f:
+        return f.read().strip()
+
+
+def _api_base() -> str:
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+    port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS",
+                          os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
+    return f"https://{host}:{port}"
+
+
+def _ssl_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context(cafile=CA_PATH)
+    return ctx
+
+
+def patch_configmap(payload: dict) -> tuple[int, bytes]:
+    """Strategic-merge-patch the worker ConfigMap with the new config.json."""
+    namespace = _read_sa_file(NS_PATH)
+    token = _read_sa_file(TOKEN_PATH)
+    url = (f"{_api_base()}/api/v1/namespaces/{namespace}"
+           f"/configmaps/{CONFIGMAP_NAME}")
+
+    body = json.dumps({
+        "data": {CONFIGMAP_KEY: json.dumps(payload)}
+    }).encode()
+
+    req = urllib.request.Request(url, data=body, method="PATCH")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/strategic-merge-patch+json")
+    req.add_header("Accept", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=_ssl_context()) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except urllib.error.URLError as e:
+        return 502, json.dumps({"error": f"k8s api unreachable: {e.reason}"}).encode()
+
+
+def fetch_worker_status() -> tuple[int, bytes]:
+    url = f"{WORKER_URL}/status"
+    req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, resp.read()
@@ -48,9 +104,6 @@ def forwardToWorker(method: str, path: str, body: bytes | None = None):
         return e.code, e.read()
     except urllib.error.URLError as e:
         return 502, json.dumps({"error": f"worker unreachable: {e.reason}"}).encode()
-    except Exception as e:
-        log.exception("forwardToWorker failed")
-        return 502, json.dumps({"error": f"worker error: {e}"}).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -65,7 +118,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self._send(200, b'{"ok":true}')
         elif self.path == "/status":
-            code, body = forwardToWorker("GET", "/status")
+            code, body = fetch_worker_status()
             self._send(code, body)
         else:
             self._send(404, b'{"error":"not found"}')
@@ -75,7 +128,6 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
 
         if self.path == "/configure":
-            # Light validation before we forward
             try:
                 payload = json.loads(raw)
                 for key in ("x", "cpu", "ram", "net"):
@@ -87,12 +139,13 @@ class Handler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, KeyError) as e:
                 self._send(400, json.dumps({"error": f"bad payload: {e}"}).encode())
                 return
-            log.info("Forwarding configure: %s", payload)
-            code, body = forwardToWorker("POST", "/configure", raw)
+            log.info("Writing configure into ConfigMap: %s", payload)
+            code, body = patch_configmap(payload)
             self._send(code, body)
 
         elif self.path == "/stop":
-            code, body = forwardToWorker("POST", "/stop", b"")
+            log.info("Writing zero-load config into ConfigMap")
+            code, body = patch_configmap(ZERO_CONFIG)
             self._send(code, body)
 
         else:
@@ -105,7 +158,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get("CONTROLLER_PORT", "8081"))
     server = HTTPServer(("0.0.0.0", port), Handler)
-    log.info("Controller listening on 0.0.0.0:%d (worker=%s)", port, WORKER_URL)
+    log.info("Controller listening on 0.0.0.0:%d (configmap=%s)",
+             port, CONFIGMAP_NAME)
     server.serve_forever()
 
 

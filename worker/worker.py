@@ -1,17 +1,16 @@
 """
 Worker pod.
 
-Listens on /configure for JSON describing how the pod should behave
-for a given network input. The JSON specifies coefficients (a, b) for
-the linear function `a*x + b` for each of CPU, RAM, and Network, plus
-the input network value x.
+Reads its desired behaviour from a JSON file on disk (sourced from a
+mounted Kubernetes ConfigMap) and reacts to changes via watchdog. The
+JSON specifies coefficients (a, b) for the linear function `a*x + b`
+for each of CPU, RAM, and Network, plus the input network value x.
 
 The worker shells out to standard load generators:
   - CPU + RAM: stress-ng
   - Network:   iperf3 (loopback server + rate-limited client)
 
 A /status endpoint reports what the worker is currently doing.
-A /stop endpoint clears the emulation.
 
 Requires `stress-ng` and `iperf3` to be present in the container image.
 """
@@ -30,6 +29,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import psutil
 from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +39,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 IPERF_PORT = 9999
+
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "/etc/emulator/config.json")
 
 STATE_LOCK = threading.Lock()
 STATE = {
@@ -136,7 +139,7 @@ def start_network(mbps: float) -> None:
     if not _wait_for_port("127.0.0.1", IPERF_PORT):
         log.warning("iperf3 server did not bind on :%d in time", IPERF_PORT)
         return
-    # iperf3 caps -t at 86400s (24h). For longer runs, re-POST /configure.
+    # iperf3 caps -t at 86400s (24h). For longer runs, re-trigger configure.
     spawn([
         "iperf3", "-c", "127.0.0.1",
         "-p", str(IPERF_PORT),
@@ -180,6 +183,8 @@ def configure(payload: dict) -> None:
       "ram": {"a": 4,   "b": 64},    # MB
       "net": {"a": 0.1, "b": 1}      # Mbps
     }
+
+    A payload with x=0 and all-zero coefficients is treated as a stop.
     """
     stop_current()
 
@@ -191,6 +196,10 @@ def configure(payload: dict) -> None:
     cpu_millicores = linear(cpu_a, cpu_b, x)
     ram_mb         = linear(ram_a, ram_b, x)
     net_mbps       = linear(net_a, net_b, x)
+
+    if cpu_millicores == 0 and ram_mb == 0 and net_mbps == 0:
+        log.info("Configured zero load — staying stopped")
+        return
 
     log.info("Configuring x=%.2f → CPU=%.0fm, RAM=%.1fMB, NET=%.2fMbps",
              x, cpu_millicores, ram_mb, net_mbps)
@@ -247,6 +256,83 @@ def configure(payload: dict) -> None:
     TARGET_RAM.set(ram_mb)
     TARGET_NET.set(net_mbps)
     INPUT_X.set(x)
+
+
+def _validate(payload: dict) -> None:
+    for key in ("x", "cpu", "ram", "net"):
+        if key not in payload:
+            raise KeyError(key)
+    for sub in ("cpu", "ram", "net"):
+        if "a" not in payload[sub] or "b" not in payload[sub]:
+            raise KeyError(f"{sub}.a/b")
+
+
+def _load_and_apply(path: str) -> None:
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        log.info("Config file %s missing — staying idle", path)
+        return
+    if not raw.strip():
+        log.info("Config file %s empty — staying idle", path)
+        return
+    try:
+        payload = json.loads(raw)
+        _validate(payload)
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+        log.error("Bad config in %s: %s", path, e)
+        return
+    try:
+        configure(payload)
+    except Exception:
+        log.exception("configure() failed")
+
+
+# Kubernetes refreshes a mounted ConfigMap by swapping the parent directory's
+# `..data` symlink atomically, so an inotify watch on the file itself misses
+# updates. Watch the *directory* and trigger on any event whose final path
+# resolves to our config file.
+class ConfigWatcher(FileSystemEventHandler):
+    def __init__(self, path: str):
+        self.path = os.path.realpath(path)
+        self.dir = os.path.dirname(self.path)
+        self._lock = threading.Lock()
+        self._debounce_until = 0.0
+
+    def _maybe_reload(self) -> None:
+        # k8s' atomic swap produces a flurry of events in quick succession;
+        # debounce so we only re-apply once per real change.
+        now = time.monotonic()
+        with self._lock:
+            if now < self._debounce_until:
+                return
+            self._debounce_until = now + 0.5
+        time.sleep(0.2)
+        _load_and_apply(self.path)
+
+    def on_any_event(self, event) -> None:
+        if event.is_directory:
+            self._maybe_reload()
+            return
+        try:
+            event_path = os.path.realpath(event.src_path)
+        except OSError:
+            return
+        if event_path == self.path or os.path.dirname(event_path) == self.dir:
+            self._maybe_reload()
+
+
+def start_config_watcher(path: str) -> Observer:
+    watch_dir = os.path.dirname(path) or "."
+    os.makedirs(watch_dir, exist_ok=True)
+    handler = ConfigWatcher(path)
+    observer = Observer()
+    observer.schedule(handler, watch_dir, recursive=False)
+    observer.daemon = True
+    observer.start()
+    log.info("Watching %s for config changes", path)
+    return observer
 
 
 # Sample once per second. CPU is measured over the elapsed interval so the
@@ -331,33 +417,6 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "not found"})
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
-
-        if self.path == "/configure":
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as e:
-                self._send_json(400, {"error": f"bad json: {e}"})
-                return
-            try:
-                configure(payload)
-            except (KeyError, ValueError, TypeError) as e:
-                self._send_json(400, {"error": f"bad payload: {e}"})
-                return
-            except Exception as e:
-                log.exception("configure failed")
-                self._send_json(500, {"error": f"configure failed: {e}"})
-                return
-            with STATE_LOCK:
-                self._send_json(200, dict(STATE))
-        elif self.path == "/stop":
-            stop_current()
-            self._send_json(200, {"stopped": True})
-        else:
-            self._send_json(404, {"error": "not found"})
-
     def log_message(self, fmt, *args):
         log.info("HTTP %s", fmt % args)
 
@@ -365,6 +424,10 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get("WORKER_PORT", "8080"))
     threading.Thread(target=sampler_loop, daemon=True).start()
+    start_config_watcher(CONFIG_PATH)
+    # Apply whatever config is already on disk at startup (the mounted
+    # ConfigMap is present before the container starts).
+    _load_and_apply(CONFIG_PATH)
     server = HTTPServer(("0.0.0.0", port), Handler)
     log.info("Worker listening on 0.0.0.0:%d", port)
     server.serve_forever()
