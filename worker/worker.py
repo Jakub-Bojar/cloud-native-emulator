@@ -289,38 +289,35 @@ def _load_and_apply(path: str) -> None:
         log.exception("configure() failed")
 
 
-# Kubernetes refreshes a mounted ConfigMap by swapping the parent directory's
-# `..data` symlink atomically, so an inotify watch on the file itself misses
-# updates. Watch the *directory* and trigger on any event whose final path
-# resolves to our config file.
+# Kubernetes refreshes a mounted ConfigMap by writing a new `..NNNN/` versioned
+# directory, atomically swapping the `..data` symlink to point at it, and then
+# deleting the old versioned directory. The user-visible `config.json` is a
+# symlink chain: config.json → ..data/config.json → ..NNNN/config.json.
+#
+# Two implications:
+#   * we must NOT resolve `path` to its realpath up front — that pins us to the
+#     starting versioned dir, which kubelet later deletes. Keep the symlink
+#     path and re-open it each time so the kernel follows it fresh.
+#   * filtering events to "only the config file" is fragile; the swap fires
+#     CREATE/MOVED_TO/DELETE on the parent directory's hidden entries. Easier
+#     to debounce-and-reload on any event in the watched directory.
 class ConfigWatcher(FileSystemEventHandler):
     def __init__(self, path: str):
-        self.path = os.path.realpath(path)
-        self.dir = os.path.dirname(self.path)
+        self.path = path
         self._lock = threading.Lock()
         self._debounce_until = 0.0
 
     def _maybe_reload(self) -> None:
-        # k8s' atomic swap produces a flurry of events in quick succession;
-        # debounce so we only re-apply once per real change.
         now = time.monotonic()
         with self._lock:
             if now < self._debounce_until:
                 return
             self._debounce_until = now + 0.5
-        time.sleep(0.2)
+        time.sleep(0.2)  # let the symlink swap settle before reading
         _load_and_apply(self.path)
 
     def on_any_event(self, event) -> None:
-        if event.is_directory:
-            self._maybe_reload()
-            return
-        try:
-            event_path = os.path.realpath(event.src_path)
-        except OSError:
-            return
-        if event_path == self.path or os.path.dirname(event_path) == self.dir:
-            self._maybe_reload()
+        self._maybe_reload()
 
 
 def start_config_watcher(path: str) -> Observer:
