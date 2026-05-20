@@ -18,7 +18,7 @@ logging.basicConfig(
 
 IPERF_PORT = 9999
 PAGE_SIZE = 4096
-RAM_TOLERANCE_MB = 2.0
+RAM_TOLERANCE_MB = 0.5
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/etc/emulator/config.json")
 
 STATE_LOCK = threading.Lock()
