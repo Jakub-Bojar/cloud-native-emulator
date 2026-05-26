@@ -1,0 +1,166 @@
+# ============================================================================
+# Worker-template blueprint (parameterized)
+# ============================================================================
+# This file is NOT meant to be `kubectl apply`-ed directly. The controller
+# reads it as a stencil: for each role in a posted template it substitutes
+# the placeholders below and POSTs the resulting objects to the Kubernetes
+# API. Keeping the blueprint as a real YAML file lets you read, edit, and
+# lint it without touching controller code.
+#
+# Placeholders the controller substitutes:
+#   __TEMPLATE__   the template's name        (e.g. "frontend-backend")
+#   __ROLE__       the role's name            (e.g. "frontend")
+#   __COUNT__      replicas for this role     (e.g. "3")
+#   __IMAGE__      worker image + tag         (e.g. "jp36/emulator-worker:latest")
+#
+# Per template, the controller creates one (ConfigMap + Deployment + Service)
+# group per role. For a template named "demo" with roles "frontend" and
+# "backend" the cluster ends up with:
+#
+#   ConfigMap/wt-demo-frontend-config   Deployment/wt-demo-frontend   Service/wt-demo-frontend
+#   ConfigMap/wt-demo-backend-config    Deployment/wt-demo-backend    Service/wt-demo-backend
+#
+# The original `worker.yaml` (single-worker, single ConfigMap) is left alone
+# and keeps working alongside this new templated flow.
+#
+# ----------------------------------------------------------------------------
+# Example /templates POST body
+# ----------------------------------------------------------------------------
+# {
+#   "name": "frontend-backend",
+#   "x": 50,
+#   "roles": {
+#     "frontend": {
+#       "count": 1,
+#       "cpu": {"a": 20, "b": 200},
+#       "ram": {"a": 8,  "b": 128},
+#       "net": {"a": 0.5, "b": 5}
+#     },
+#     "backend": {
+#       "count": 3,
+#       "cpu": {"a": 5, "b": 50},
+#       "ram": {"a": 2, "b": 32},
+#       "net": {"a": 0.1, "b": 1}
+#     }
+#   },
+#   "edges": [
+#     { "from": "frontend", "to": "backend" }
+#   ]
+# }
+#
+# `edges` are directional: every pod of `from` sends iperf3 traffic to the
+# Service of `to`. So `frontend -> backend` with backend.count = 3 is a
+# 1-to-many fan-out (k8s Service round-robins TCP connects across backend
+# pods). A many-to-many mesh is expressed as multiple edges.
+# ============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wt-__TEMPLATE__-__ROLE__-config
+  labels:
+    app.kubernetes.io/managed-by: emulator-controller
+    template: __TEMPLATE__
+    role: __ROLE__
+data:
+  # Default: zero load, no peers. The controller overwrites `data.config.json`
+  # right after creation with the role's real formulas + the peer list it
+  # computes from the template's edges.
+  config.json: |
+    {
+      "x": 0,
+      "cpu": { "a": 0, "b": 0 },
+      "ram": { "a": 0, "b": 0 },
+      "net": { "a": 0, "b": 0 },
+      "peers": []
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wt-__TEMPLATE__-__ROLE__
+  labels:
+    app.kubernetes.io/managed-by: emulator-controller
+    template: __TEMPLATE__
+    role: __ROLE__
+spec:
+  replicas: __COUNT__
+  selector:
+    matchLabels:
+      template: __TEMPLATE__
+      role: __ROLE__
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: emulator-controller
+        template: __TEMPLATE__
+        role: __ROLE__
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: worker
+          image: __IMAGE__
+          imagePullPolicy: Always
+          env:
+            # The worker uses POD_NAME to deterministically pick which
+            # port in each peer's iperf3 server pool it connects to, so
+            # multiple source pods sending to the same target distribute
+            # across the pool instead of all colliding on port 9999.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Size of the iperf3 server pool. Each port = ~1.2 MiB
+            # resident, so this directly contributes to the worker's
+            # RAM baseline. Larger pool tolerates more concurrent
+            # inbound peers (useful for many-to-many topologies) at the
+            # cost of higher baseline RAM. 2 is enough for 1-to-many
+            # fan-out; bump to 8+ for many-to-many.
+            - name: IPERF_PORT_COUNT
+              value: "2"
+          ports:
+            # HTTP control / status / Prometheus metrics.
+            - { name: http,   containerPort: 8080 }
+            # iperf3 server pool entry point (9999). The worker also
+            # binds 10000..10006 internally — these don't need to be
+            # individually declared as containerPorts (declarations are
+            # advisory in k8s; the Service below uses targetPort: 9999).
+            - { name: iperf3, containerPort: 9999 }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 2
+          volumeMounts:
+            - name: config
+              mountPath: /etc/emulator
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: wt-__TEMPLATE__-__ROLE__-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wt-__TEMPLATE__-__ROLE__
+  labels:
+    app.kubernetes.io/managed-by: emulator-controller
+    template: __TEMPLATE__
+    role: __ROLE__
+spec:
+  selector:
+    template: __TEMPLATE__
+    role: __ROLE__
+  ports:
+    - { name: http,   port: 8080, targetPort: 8080 }
+    - { name: iperf3, port: 9999, targetPort: 9999 }
+  type: ClusterIP
