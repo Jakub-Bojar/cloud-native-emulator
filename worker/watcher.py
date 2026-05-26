@@ -41,6 +41,12 @@ def _validate(payload: dict) -> None:
     for sub in ("cpu", "ram", "net"):
         if "a" not in payload[sub] or "b" not in payload[sub]:
             raise KeyError(f"{sub}.a/b")
+    # Optional. configure() also tolerates a missing/malformed peers
+    # field, but we reject obviously-wrong shapes here so the error
+    # surfaces in the watcher log rather than buried later.
+    peers = payload.get("peers")
+    if peers is not None and not isinstance(peers, list):
+        raise ValueError("peers must be a list of strings if present")
 
 
 def _load_and_apply(path: str, callback: ConfigCallback) -> None:
@@ -72,24 +78,37 @@ class ConfigWatcher(FileSystemEventHandler):
         self.path = path
         self.callback = callback
         self._lock = threading.Lock()
-        self._debounce_until = 0.0
+        self._timer: threading.Timer | None = None
+
+    # Trailing-edge debounce: every filesystem event cancels any pending
+    # timer and schedules a fresh one 2 s from now.  kubelet's ConfigMap
+    # swap generates multiple events spread over ~1–2 s (create new
+    # timestamped directory, write files, swap ..data symlink, delete old
+    # directory).  The old leading-edge approach fired after the very
+    # first event — before the symlink had actually been swapped — and
+    # then fired again when the swap arrived, causing duplicate configures.
+    # With a 2 s trailing window the callback fires exactly ONCE, after
+    # the last filesystem event from a single ConfigMap patch has settled.
+    _DEBOUNCE_S = 2.0
 
     def _maybe_reload(self) -> None:
-        # The atomic swap produces a flurry of events in quick succession;
-        # debounce so we only re-apply once per real change.
-        now = time.monotonic()
         with self._lock:
-            if now < self._debounce_until:
-                return
-            self._debounce_until = now + 0.5
-        time.sleep(0.2)
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._DEBOUNCE_S, self._do_reload)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _do_reload(self) -> None:
+        with self._lock:
+            self._timer = None
         _load_and_apply(self.path, self.callback)
 
     def on_any_event(self, event) -> None:
         # Any event in the watch directory could be the ..data symlink swap
         # or a temp file landing inside the new ..XXX directory. We can't
-        # filter on exact paths because kubelet picks unpredictable
-        # timestamped names; the debounce handles the resulting flurry.
+        # filter on exact paths because kubelet uses unpredictable
+        # timestamped names; the debounce collapses the burst into one call.
         self._maybe_reload()
 
 

@@ -30,7 +30,7 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import loads
 import metrics
 import watcher
-from state import CONFIG_PATH, STATE, STATE_LOCK, linear
+from state import CONFIG_PATH, POD_NAME, STATE, STATE_LOCK, linear
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +57,20 @@ def configure(payload: dict) -> None:
     cpu_a, cpu_b = float(payload["cpu"]["a"]), float(payload["cpu"]["b"])
     ram_a, ram_b = float(payload["ram"]["a"]), float(payload["ram"]["b"])
     net_a, net_b = float(payload["net"]["a"]), float(payload["net"]["b"])
+    # Distinguish "peers field absent" (legacy single-worker mode → loopback
+    # iperf3) from "peers field present but empty" (templated role with no
+    # outbound edges → keep the iperf3 server slot free for inbound peer
+    # connections from other roles; spawning a loopback client here would
+    # occupy the server and block all inbound traffic).
+    raw_peers = payload.get("peers")
+    templated_mode = raw_peers is not None
+    if raw_peers is not None and (
+            not isinstance(raw_peers, list)
+            or not all(isinstance(p, str) for p in raw_peers)):
+        log.warning("peers field is not a list[str], ignoring: %r", raw_peers)
+        raw_peers = []
+        templated_mode = False
+    peers = raw_peers or []
 
     cpu_millicores = linear(cpu_a, cpu_b, x)
     ram_mb         = linear(ram_a, ram_b, x)
@@ -66,13 +80,36 @@ def configure(payload: dict) -> None:
         log.info("Configured zero load — staying stopped")
         return
 
-    log.info("Configuring x=%.2f → CPU=%.0fm, RAM=%.1fMB, NET=%.2fMbps",
-             x, cpu_millicores, ram_mb, net_mbps)
+    if peers:
+        mode_str = f"peers={peers}"
+    elif templated_mode:
+        mode_str = "peers=[] (templated, server-only)"
+    else:
+        mode_str = "peers=<loopback>"
+    log.info("Configuring x=%.2f → CPU=%.0fm, RAM=%.1fMB, NET=%.2fMbps %s",
+             x, cpu_millicores, ram_mb, net_mbps, mode_str)
 
     # Network first so iperf3 is part of the baseline that gets subtracted
     # from the CPU and RAM targets.
-    loads.start_network(net_mbps)
-    time.sleep(1.0)  # let iperf3 reach steady state
+    server_count = payload.get("server_count")
+    # The controller assigns each source pod a unique port offset so it
+    # connects to a distinct iperf3 server port on every target pod.
+    # This avoids the iperf3 single-session limit when multiple source
+    # pods would otherwise all try the same port simultaneously.
+    port_offset_by_pod: dict = payload.get("port_offset_by_pod") or {}
+    my_port_offset: int = int(port_offset_by_pod.get(POD_NAME, 0))
+    if port_offset_by_pod:
+        log.info("Port offset for this pod (%s): %d", POD_NAME, my_port_offset)
+    loads.start_network(net_mbps, peers, legacy_loopback=not templated_mode,
+                        server_count=server_count,
+                        my_port_offset=my_port_offset)
+    # Loopback iperf3 reaches steady state within ~1 s. In peer mode the
+    # supervisor threads have just spawned their clients but the peer pods
+    # may still be coming up — we sleep the same 1 s anyway so the
+    # baseline measurement window below includes whatever traffic we can
+    # generate immediately; CPU subtraction stays correct as more peers
+    # come online (the sampler thread keeps the actual gauge live).
+    time.sleep(1.0)
 
     # Sample CPU over a 1 s window to get a meaningful baseline_mc.
     self_proc = psutil.Process(os.getpid())
@@ -120,6 +157,7 @@ def configure(payload: dict) -> None:
                 "ram": {"a": ram_a, "b": ram_b},
                 "net": {"a": net_a, "b": net_b},
             },
+            "peers": peers,
         })
 
     metrics.TARGET_CPU.set(cpu_millicores)

@@ -5,8 +5,8 @@
     "name": "worker-emulator",
     "namespace": "default",
     "uid": "821a4f5e-ce99-42c6-bebe-f260fcab6e41",
-    "resourceVersion": "1778769168004989",
-    "generation": 16,
+    "resourceVersion": "1778846742107015",
+    "generation": 19,
     "creationTimestamp": "2026-05-14T08:51:23Z",
     "labels": {
       "grafana.app/deprecatedInternalID": "1029000667705344"
@@ -16,7 +16,7 @@
       "grafana.app/folder": "",
       "grafana.app/saved-from-ui": "Grafana v13.0.1 (a100054f)",
       "grafana.app/updatedBy": "user:afluemnotpkaoa",
-      "grafana.app/updatedTimestamp": "2026-05-14T14:32:48Z"
+      "grafana.app/updatedTimestamp": "2026-05-15T12:05:42Z"
     }
   },
   "spec": {
@@ -88,7 +88,7 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "rate(container_cpu_usage_seconds_total{pod=~\"$pod\", container=\"worker\"}[5m]) * 1000",
+                        "expr": "rate(container_cpu_usage_seconds_total{pod=~\"$pod\", container=\"worker\"}[1m]) * 1000",
                         "legendFormat": "actual {{pod}}",
                         "range": true
                       }
@@ -226,7 +226,7 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "  worker_target_cpu_millicores{pod=~\"$pod\"}\n- on(pod)\n  sum by(pod) (rate(container_cpu_usage_seconds_total{pod=~\"$pod\", container=\"worker\"}[2m])) * 1000",
+                        "expr": "  worker_target_cpu_millicores{pod=~\"$pod\"}\n- on(pod)\n  sum by(pod) (rate(container_cpu_usage_seconds_total{pod=~\"$pod\", container=\"worker\"}[1m])) * 1000",
                         "legendFormat": "{{pod}}",
                         "range": true
                       }
@@ -578,7 +578,7 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "avg by(pod) (avg_over_time(worker_actual_net_mbps{pod=~\"$pod\"}[5m]))",
+                        "expr": "avg by(pod) (avg_over_time(worker_actual_net_mbps{pod=~\"$pod\"}[1m]))",
                         "legendFormat": "actual {{pod}}",
                         "range": true
                       }

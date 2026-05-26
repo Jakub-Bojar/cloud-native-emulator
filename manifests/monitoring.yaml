@@ -4,11 +4,24 @@
 # Two ways to scrape the worker:
 #
 # 1. Stock Prometheus (kube-prometheus-stack, bitnami chart, etc.):
-#    the worker pod is already annotated with prometheus.io/scrape=true
-#    in emulator.yaml — most default configs pick that up automatically.
+#    every worker pod is annotated with prometheus.io/scrape=true in both
+#    worker.yaml and the worker-template blueprint — most default configs
+#    pick that up automatically.
 #
-# 2. Prometheus Operator: apply the PodMonitor below. It tells the operator
-#    to scrape every pod labeled app=worker on port 8080 path /metrics.
+# 2. Prometheus Operator: apply the two PodMonitors below.
+#
+#    `worker` matches the legacy single-worker Deployment (label app=worker).
+#
+#    `worker-templates` matches every pod created by the controller's
+#    template materializer (label app.kubernetes.io/managed-by=emulator-controller).
+#    The materializer also stamps `template=<name>` and `role=<name>` onto
+#    each pod, so once scraping is working you can group / filter in
+#    Grafana by those labels via the `pod` series label.
+#
+# Two PodMonitors instead of one broader selector keeps the legacy worker's
+# `worker-service` (which selects app=worker) routing to only the legacy
+# pod. Giving templated pods app=worker would silently put them behind that
+# Service alongside the legacy worker.
 # ============================================================================
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
@@ -25,5 +38,23 @@ spec:
   podMetricsEndpoints:
     - port: ""              # unnamed container port — match by number below
       targetPort: 8080
+      path: /metrics
+      interval: 5s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: worker-templates
+  labels:
+    release: kps
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/managed-by: emulator-controller
+  podMetricsEndpoints:
+    # Templated pods name their HTTP port `http` (see worker-template.yaml).
+    # Using the port name instead of targetPort means this PodMonitor stays
+    # correct even if the port number changes later.
+    - port: http
       path: /metrics
       interval: 5s

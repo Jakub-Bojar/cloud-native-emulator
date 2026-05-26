@@ -1,33 +1,44 @@
 """
 Controller pod.
 
-Acts as the front door for the emulation. The user (or an experiment
-driver) POSTs JSON to this pod describing how the worker should behave.
-Instead of forwarding directly to the worker over HTTP, the controller
-writes the JSON into the `worker-config` ConfigMap via the Kubernetes
-API; kubelet then refreshes the mounted file inside the worker pod, and
-the worker reacts via its filesystem watcher.
+Acts as the front door for the emulation. Two ingestion modes:
 
-Separating "what to do" (controller) from "how to do it" (worker) lets
-many workers be addressed through a single declarative resource, and
-makes the configuration trail visible to anything that watches the
-cluster (kubectl, GitOps tooling, audit logs, etc).
+  Legacy single-worker mode
+    POST /configure → validate JSON → patch the static `worker-config`
+    ConfigMap. The standalone worker Deployment (manifests/worker.yaml)
+    watches that file and re-runs its emulation.
+
+  Templated multi-worker mode
+    POST /templates → validate JSON → materializer creates one
+    Deployment + ConfigMap + Service per role declared in the template,
+    and writes each role's load formulas + peer list into its ConfigMap.
+    DELETE /templates/<name> tears the whole topology down.
+
+The two modes are independent — running templates does not interfere
+with the legacy single worker, and vice versa.
 
 Endpoints
 ---------
-POST /configure   validate + write JSON into worker-config ConfigMap
-GET  /status      proxy worker's current state (still over HTTP)
-POST /stop        write zero-load config into worker-config ConfigMap
-GET  /healthz     liveness for k8s
+POST   /configure          validate + write JSON into worker-config ConfigMap
+GET    /status             proxy worker's current state (still over HTTP)
+POST   /stop               write zero-load config into worker-config ConfigMap
+POST   /templates          materialize a posted template
+GET    /templates          list names of currently materialized templates
+GET    /templates/<name>   inspect a materialized template (peers, replicas)
+DELETE /templates/<name>   tear down a materialized template
+GET    /healthz            liveness for k8s
 """
 
 import json
 import os
-import ssl
 import logging
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import k8s
+import materializer
+import watcher
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,11 +50,6 @@ WORKER_URL = os.environ.get("WORKER_URL", "http://worker-service:8080")
 CONFIGMAP_NAME = os.environ.get("CONFIGMAP_NAME", "worker-config")
 CONFIGMAP_KEY = os.environ.get("CONFIGMAP_KEY", "config.json")
 
-SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
-TOKEN_PATH = f"{SA_DIR}/token"
-CA_PATH = f"{SA_DIR}/ca.crt"
-NS_PATH = f"{SA_DIR}/namespace"
-
 ZERO_CONFIG = {
     "x": 0,
     "cpu": {"a": 0, "b": 0},
@@ -52,46 +58,12 @@ ZERO_CONFIG = {
 }
 
 
-def _read_sa_file(path: str) -> str:
-    with open(path, "r") as f:
-        return f.read().strip()
-
-
-def _api_base() -> str:
-    host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
-    port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS",
-                          os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
-    return f"https://{host}:{port}"
-
-
-def _ssl_context() -> ssl.SSLContext:
-    ctx = ssl.create_default_context(cafile=CA_PATH)
-    return ctx
-
-
 def patch_configmap(payload: dict) -> tuple[int, bytes]:
     """Strategic-merge-patch the worker ConfigMap with the new config.json."""
-    namespace = _read_sa_file(NS_PATH)
-    token = _read_sa_file(TOKEN_PATH)
-    url = (f"{_api_base()}/api/v1/namespaces/{namespace}"
-           f"/configmaps/{CONFIGMAP_NAME}")
-
-    body = json.dumps({
-        "data": {CONFIGMAP_KEY: json.dumps(payload)}
-    }).encode()
-
-    req = urllib.request.Request(url, data=body, method="PATCH")
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/strategic-merge-patch+json")
-    req.add_header("Accept", "application/json")
-
-    try:
-        with urllib.request.urlopen(req, timeout=10, context=_ssl_context()) as resp:
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read()
-    except urllib.error.URLError as e:
-        return 502, json.dumps({"error": f"k8s api unreachable: {e.reason}"}).encode()
+    path = (f"/api/v1/namespaces/{k8s.namespace()}"
+            f"/configmaps/{CONFIGMAP_NAME}")
+    body = {"data": {CONFIGMAP_KEY: json.dumps(payload)}}
+    return k8s.patch(path, body)
 
 
 def fetch_worker_status() -> tuple[int, bytes]:
@@ -114,12 +86,38 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, code: int, obj) -> None:
+        self._send(code, json.dumps(obj).encode())
+
     def do_GET(self):
         if self.path == "/healthz":
             self._send(200, b'{"ok":true}')
         elif self.path == "/status":
             code, body = fetch_worker_status()
             self._send(code, body)
+        elif self.path == "/templates":
+            try:
+                names = materializer.list_managed()
+            except Exception as e:
+                log.exception("list_managed failed")
+                self._send_json(502, {"error": f"list failed: {e}"})
+                return
+            self._send_json(200, {"templates": names})
+        elif self.path.startswith("/templates/"):
+            name = self.path[len("/templates/"):]
+            if "/" in name or not name:
+                self._send_json(400, {"error": "expected /templates/<name>"})
+                return
+            try:
+                info = materializer.get_managed(name)
+            except Exception as e:
+                log.exception("get_managed failed")
+                self._send_json(502, {"error": str(e)})
+                return
+            if info is None:
+                self._send_json(404, {"error": f"no template named {name!r}"})
+                return
+            self._send_json(200, info)
         else:
             self._send(404, b'{"error":"not found"}')
 
@@ -148,6 +146,54 @@ class Handler(BaseHTTPRequestHandler):
             code, body = patch_configmap(ZERO_CONFIG)
             self._send(code, body)
 
+        elif self.path == "/templates":
+            try:
+                template = json.loads(raw)
+            except json.JSONDecodeError as e:
+                self._send_json(400, {"error": f"invalid JSON: {e}"})
+                return
+            try:
+                materializer.validate(template)
+            except ValueError as e:
+                self._send_json(400, {"error": str(e)})
+                return
+            log.info("Materializing template %s", template.get("name"))
+            try:
+                materializer.materialize(template)
+            except RuntimeError as e:
+                # k8s API rejected one of the create/patch calls. Partial
+                # materialization is possible; teardown by name to clean up.
+                log.exception("materialize failed")
+                self._send_json(502, {"error": str(e)})
+                return
+            except Exception as e:
+                log.exception("materialize raised unexpected error")
+                self._send_json(500, {"error": str(e)})
+                return
+            self._send_json(201, {
+                "name": template["name"],
+                "roles": list(template["roles"].keys()),
+                "peers": materializer.compute_peers(template),
+            })
+
+        else:
+            self._send(404, b'{"error":"not found"}')
+
+    def do_DELETE(self):
+        prefix = "/templates/"
+        if self.path.startswith(prefix) and len(self.path) > len(prefix):
+            name = self.path[len(prefix):]
+            if "/" in name or not name:
+                self._send_json(400, {"error": "expected /templates/<name>"})
+                return
+            log.info("Tearing down template %s", name)
+            try:
+                deleted = materializer.teardown(name)
+            except Exception as e:
+                log.exception("teardown failed")
+                self._send_json(502, {"error": str(e)})
+                return
+            self._send_json(200, {"name": name, "deleted": deleted})
         else:
             self._send(404, b'{"error":"not found"}')
 
@@ -157,6 +203,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("CONTROLLER_PORT", "8081"))
+    # Declarative ingestion: poll labelled ConfigMaps and reconcile them
+    # via the same materializer used by POST /templates.
+    watcher.start()
     server = HTTPServer(("0.0.0.0", port), Handler)
     log.info("Controller listening on 0.0.0.0:%d (configmap=%s)",
              port, CONFIGMAP_NAME)

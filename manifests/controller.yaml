@@ -5,9 +5,20 @@
 # can hit it from your laptop while developing; switch to ClusterIP/Ingress
 # in production.
 #
-# The controller writes desired emulator state into the `worker-config`
-# ConfigMap. That requires `get`/`patch` permission on that specific
-# ConfigMap, granted via the ServiceAccount + Role + RoleBinding below.
+# The controller does two things that require Kubernetes API access:
+#
+#   1. The legacy /configure flow patches the static `worker-config`
+#      ConfigMap (consumed by manifests/worker.yaml).
+#   2. The template materializer (controller/materializer.py) creates,
+#      updates, and deletes ConfigMaps, Deployments, and Services to
+#      stand up the topologies posted to /templates or declared via
+#      labelled template ConfigMaps.
+#
+# The Role below grants both. It's namespace-scoped (not cluster-wide)
+# and intentionally NOT bound to specific resource names — the
+# materializer makes up names at runtime. The materializer label-scopes
+# its own deletes via `labelSelector` so it can only ever touch
+# resources it created.
 # ============================================================================
 apiVersion: v1
 kind: ServiceAccount
@@ -17,23 +28,39 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: controller-configmap-writer
+  name: controller-emulator
 rules:
+  # ConfigMaps: legacy worker-config patches + materialized role configs +
+  # watching labelled template ConfigMaps (Step 6).
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["worker-config"]
-    verbs: ["get", "patch", "update"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Services fronting each role.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  # Endpoints — read-only. The materializer reads these to enumerate
+  # concrete backend pod IPs and write them into source-role ConfigMaps,
+  # so iperf3 clients can hit specific pods rather than the Service
+  # (avoiding the TCP-stickiness fan-out problem).
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list"]
+  # The Deployment per role.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: controller-configmap-writer
+  name: controller-emulator
 subjects:
   - kind: ServiceAccount
     name: controller-sa
 roleRef:
   kind: Role
-  name: controller-configmap-writer
+  name: controller-emulator
   apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: v1
