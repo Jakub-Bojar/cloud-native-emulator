@@ -180,7 +180,7 @@ def _wait_for_endpoint_pods(service_name: str, want_count: int,
 
 def _resolve_peer_ips(
         template: dict,
-) -> tuple[dict[str, list[str]], dict[str, dict[str, int]]]:
+) -> tuple[dict[str, list[str]], dict[str, dict[str, int]], dict[str, int]]:
     """Expand each role's peer Services into bare pod IPs and assign each
     source pod a deterministic port offset so it lands on a unique iperf3
     server port on every target pod.
@@ -192,10 +192,17 @@ def _resolve_peer_ips(
         derived from the pod's own assigned offset).
     port_offset_by_pod_by_role : dict[role, dict[pod_name, offset]]
         Each source pod's port offset (0-based). The worker connects to
-        IPERF_BASE_PORT + offset on every peer IP. Offsets are assigned
-        by sorting the source pods by name (deterministic) and assigning
-        0, 1, 2, … in order, capped at the target pool size so no offset
-        exceeds the target's server count.
+        IPERF_BASE_PORT + offset on every peer IP.  Offsets are assigned
+        globally across *all* source roles that connect to a given target:
+        the first source role gets 0, 1, …, N-1; the next source role
+        picks up at N, N+1, …; and so on.  This guarantees no two pods
+        ever land on the same port on the same target, even when multiple
+        source roles share a target (e.g. A→C and B→C).
+    effective_server_count : dict[role, int]
+        The number of iperf3 server slots each role actually needs.  Equal
+        to (max offset assigned to any pod connecting to that role) + 1.
+        May exceed the raw fanin when a source role's offset was "inflated"
+        by a shared target it also connects to.
     """
     name = template["name"]
     intended = compute_peers(template)
@@ -206,6 +213,13 @@ def _resolve_peer_ips(
     # Cache target Service → pod IPs.
     ip_cache: dict[str, list[str]] = {}
 
+    # Global offset counter per target role.  Tracks how many offset slots
+    # have already been consumed across all source roles that connect to a
+    # given target.  Each new source role picks up from here so offsets are
+    # globally unique — no two pods land on the same server port on the same
+    # target, regardless of how many different source roles point to it.
+    next_offset: dict[str, int] = {}
+
     for src_role, services in intended.items():
         if not services:
             continue
@@ -215,15 +229,19 @@ def _resolve_peer_ips(
         src_svc = f"wt-{name}-{src_role}"
         src_count = int(template["roles"][src_role].get("count", 1))
         src_pods = _wait_for_endpoint_pods(src_svc, src_count)
-        src_pods_sorted = sorted(src_pods, key=lambda t: t[0])  # sort by name for determinism
-        # Pool size = fanin of the target role this source role connects to.
-        # All services in this loop share the same target fanin (one outbound
-        # edge per role in the common case). Pick from the first service.
+        src_pods_sorted = sorted(src_pods, key=lambda t: t[0])
+
+        # Derive the base offset for this source role from the first target
+        # role it connects to (all targets share the same source-pod list so
+        # the base only needs to be anchored to one of them).
         first_target_role = services[0][len(f"wt-{name}-"):]
-        target_pool = max(1, fanin[first_target_role])
+        base = next_offset.get(first_target_role, 0)
         for idx, (pod_name, _) in enumerate(src_pods_sorted):
             if pod_name:
-                offsets[src_role][pod_name] = idx % target_pool
+                offsets[src_role][pod_name] = base + idx
+        # Advance the counter so the next source role connecting to this
+        # target starts immediately after the last offset we just assigned.
+        next_offset[first_target_role] = base + len(src_pods_sorted)
 
         for svc in services:
             if svc not in ip_cache:
@@ -235,7 +253,23 @@ def _resolve_peer_ips(
                 if ip not in resolved[src_role]:
                     resolved[src_role].append(ip)
 
-    return resolved, offsets
+    # Compute the effective server-pool size required by each target role.
+    # Raw fanin is enough when all sources start from 0, but when a source
+    # role's base offset was inflated (because it shares a target with
+    # another role that was processed first), the target it *also* connects
+    # to may need more server slots than its own fanin implies.
+    effective_server_count: dict[str, int] = {r: 0 for r in template["roles"]}
+    for src_role, pod_offsets in offsets.items():
+        if not pod_offsets:
+            continue
+        max_offset = max(pod_offsets.values())
+        for svc in intended.get(src_role, []):
+            target_role = svc[len(f"wt-{name}-"):]
+            effective_server_count[target_role] = max(
+                effective_server_count[target_role], max_offset + 1
+            )
+
+    return resolved, offsets, effective_server_count
 
 
 def _compute_fanin(template: dict) -> dict[str, int]:
@@ -372,23 +406,36 @@ def materialize(template: dict, source: str = SOURCE_HTTP) -> None:
 
     # ─── Phase 2: resolve peers to pod IPs and patch ConfigMaps ─────────
     log.info("Template %s: waiting for endpoints to populate…", name)
-    peers_by_role, offsets_by_role = _resolve_peer_ips(template)
+    peers_by_role, offsets_by_role, effective_sc = _resolve_peer_ips(template)
     for role_name in template["roles"]:
         peer_ips = peers_by_role[role_name]
-        if not peer_ips:
+        sc = effective_sc.get(role_name) or None
+
+        # Patch roles that have outbound peers (the common case) OR roles
+        # that are pure sinks whose effective server count differs from the
+        # Phase 1 fanin estimate. The latter happens when a source role has
+        # an inflated offset (because it shares a target with another source
+        # role), causing it to connect to a higher-numbered port on the sink
+        # than the sink's raw fanin would suggest — e.g. batch→cache AND
+        # batch→storage where batch gets offsets 2,3 (not 0,1) because web
+        # was processed first for cache, so storage also needs 4 servers
+        # even though only 2 pods connect to it.
+        needs_sc_update = sc is not None and sc != (fanin[role_name] or None)
+        if not peer_ips and not needs_sc_update:
             continue
+
         cm_name = f"wt-{name}-{role_name}-config"
         config_payload = json.dumps(
             _role_config(template, role_name, peer_ips,
-                         server_count=fanin[role_name] or None,
+                         server_count=sc,
                          port_offset_by_pod=offsets_by_role[role_name] or None),
             indent=2,
         )
         patch_body = {"data": {"config.json": config_payload}}
         status, body = k8s.patch(_kind_path("ConfigMap", cm_name), patch_body)
         if 200 <= status < 300:
-            log.info("Template %s: wrote %d peer IPs + offsets %s into %s",
-                     name, len(peer_ips), offsets_by_role[role_name], cm_name)
+            log.info("Template %s: wrote %d peer IPs + offsets %s (server_count=%s) into %s",
+                     name, len(peer_ips), offsets_by_role[role_name], sc, cm_name)
         else:
             log.warning("Template %s: peer-IP patch on %s failed: %s",
                         name, cm_name, status)
