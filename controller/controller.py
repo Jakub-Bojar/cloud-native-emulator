@@ -179,6 +179,50 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, b'{"error":"not found"}')
 
+    def do_PATCH(self):
+        prefix = "/templates/"
+        if not (self.path.startswith(prefix) and len(self.path) > len(prefix)):
+            self._send(404, b'{"error":"not found"}')
+            return
+        name = self.path[len(prefix):]
+        if "/" in name or not name:
+            self._send_json(400, {"error": "expected /templates/<name>"})
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        try:
+            patch = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as e:
+            self._send_json(400, {"error": f"invalid JSON: {e}"})
+            return
+        if not isinstance(patch, dict):
+            self._send_json(400, {"error": "PATCH body must be a JSON object"})
+            return
+        try:
+            merged = materializer.patch_template(name, patch)
+        except ValueError as e:
+            # Either the merged template failed validation (bad field,
+            # cycle, missing required key) or we surfaced a structural
+            # issue from the merge — all client-side problems → 400.
+            self._send_json(400, {"error": str(e)})
+            return
+        except RuntimeError as e:
+            log.exception("patch_template: k8s API failure")
+            self._send_json(502, {"error": str(e)})
+            return
+        except Exception as e:
+            log.exception("patch_template raised unexpected error")
+            self._send_json(500, {"error": str(e)})
+            return
+        if merged is None:
+            self._send_json(404, {"error": f"no template named {name!r}"})
+            return
+        self._send_json(200, {
+            "name": name,
+            "template": merged,
+            "peers": materializer.compute_peers(merged),
+        })
+
     def do_DELETE(self):
         prefix = "/templates/"
         if self.path.startswith(prefix) and len(self.path) > len(prefix):

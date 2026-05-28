@@ -130,7 +130,7 @@ kind: ConfigMap
 metadata:
   name: fb
   labels:
-    emulator.anthropic.dev/template: "true"     # the watcher's marker
+    emulator.local/template: "true"     # the watcher's marker
 data:
   template.json: |
     {
@@ -366,7 +366,7 @@ for t in $(curl -s http://192.168.2.2:30081/templates | python3 -c "import sys,j
 done
 
 # Plus any labelled CMs the watcher would otherwise pick up again
-microk8s kubectl get configmap -l emulator.anthropic.dev/template=true -o name \
+microk8s kubectl get configmap -l emulator.local/template=true -o name \
   | xargs -r microk8s kubectl delete
 ```
 

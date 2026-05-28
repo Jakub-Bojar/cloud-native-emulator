@@ -2,7 +2,7 @@
 Declarative ingestion: ConfigMap reconciler.
 
 Users can write a Kubernetes ConfigMap with the label
-`emulator.anthropic.dev/template=true` and a `data.template.json` field
+`emulator.local/template=true` and a `data.template.json` field
 containing a topology (same schema as the HTTP POST body). This module
 polls those labelled ConfigMaps every WATCH_INTERVAL_S seconds and
 keeps the cluster in sync:
@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 
 # Label on the user-authored ConfigMap that flags it as a template
 # declaration. Both key and value are matched exactly.
-TEMPLATE_LABEL_KEY = "emulator.anthropic.dev/template"
+TEMPLATE_LABEL_KEY = "emulator.local/template"
 TEMPLATE_LABEL_VALUE = "true"
 
 # Field inside data.* that carries the template JSON.

@@ -45,14 +45,14 @@ ROLE_LABEL = "role"
 # Each managed ConfigMap carries the original template JSON as an
 # annotation so GET /templates/<name> can reconstruct the template from
 # the cluster without the controller maintaining in-memory state.
-TEMPLATE_ANNOTATION = "emulator.anthropic.dev/template"
+TEMPLATE_ANNOTATION = "emulator.local/template"
 
 # Which ingestion path created the template: "http" (POST /templates) or
 # "watch" (declarative ConfigMap labelled with TEMPLATE_LABEL_FILTER, see
 # watcher.py). The ConfigMap-watch reconciler only tears down templates
 # whose source is "watch", so an HTTP-created template is never killed
 # by a missing labelled ConfigMap.
-SOURCE_ANNOTATION = "emulator.anthropic.dev/source"
+SOURCE_ANNOTATION = "emulator.local/source"
 SOURCE_HTTP = "http"
 SOURCE_WATCH = "watch"
 
@@ -89,6 +89,12 @@ def validate(template: dict) -> None:
             raise ValueError(f"edge.from {edge.get('from')!r} not in roles")
         if edge.get("to") not in roles:
             raise ValueError(f"edge.to {edge.get('to')!r} not in roles")
+
+    # Cycle detection.  x is resolved per role by a topological pass over
+    # the role graph (see _compute_resolved_x); a cycle would make the
+    # system underdetermined, so reject it here so the caller gets a clean
+    # 400 instead of a half-materialized template.
+    _compute_resolved_x(template)
 
 
 # ----------------------------------------------------------------------------
@@ -285,10 +291,86 @@ def _compute_fanin(template: dict) -> dict[str, int]:
     return fanin
 
 
+def _compute_resolved_x(template: dict) -> dict[str, float]:
+    """For each role, the x value its load formulas should evaluate at.
+
+    The template's `x` is treated as a *signal* that propagates through
+    the role graph rather than a global constant every role shares:
+
+      - A source role (no inbound edges) uses the template's `x`.
+      - A downstream role's `x` is the sum of upstream role-total egress.
+        For an upstream role U with count N and net coefficients (a, b),
+        U contributes  N * max(0, a * x_U + b)  Mbps to each downstream's x.
+
+    This lets a sink's CPU/RAM/NET formulas scale with the *actual* traffic
+    arriving at it instead of the raw input, which matches real distributed
+    systems where downstream cost is driven by upstream load.
+
+    Self-edges (intra-role mesh with count > 1) are legal traffic-wise but
+    are skipped for x-resolution — a role can't feed its own x without
+    making the system circular.
+
+    Raises ValueError if the role graph contains a cycle.
+    """
+    roles = template["roles"]
+    template_x = float(template.get("x", 0))
+
+    # Build dedup'd upstream / downstream adjacency over role pairs.
+    upstreams: dict[str, set[str]] = {r: set() for r in roles}
+    downstreams: dict[str, set[str]] = {r: set() for r in roles}
+    for edge in template.get("edges", []) or []:
+        src, dst = edge["from"], edge["to"]
+        if src == dst:
+            continue
+        upstreams[dst].add(src)
+        downstreams[src].add(dst)
+
+    # Kahn's algorithm.  A role is ready to compute once every upstream
+    # has produced its own x; at that point its x is the accumulated
+    # sum of upstream role-total egress.
+    resolved: dict[str, float] = {}
+    accum: dict[str, float] = {r: 0.0 for r in roles}
+    remaining: dict[str, int] = {r: len(upstreams[r]) for r in roles}
+
+    queue: list[str] = []
+    for r in roles:
+        if remaining[r] == 0:
+            resolved[r] = template_x
+            queue.append(r)
+
+    head = 0
+    while head < len(queue):
+        r = queue[head]
+        head += 1
+        role = roles[r]
+        per_pod_egress = max(0.0,
+                             float(role["net"]["a"]) * resolved[r]
+                             + float(role["net"]["b"]))
+        role_total_egress = int(role["count"]) * per_pod_egress
+        for dn in downstreams[r]:
+            accum[dn] += role_total_egress
+            remaining[dn] -= 1
+            if remaining[dn] == 0:
+                resolved[dn] = accum[dn]
+                queue.append(dn)
+
+    if len(resolved) != len(roles):
+        unresolved = sorted(r for r in roles if r not in resolved)
+        raise ValueError(
+            f"role graph has a cycle involving: {', '.join(unresolved)}"
+        )
+    return resolved
+
+
 def _role_config(template: dict, role_name: str, peers: list[str],
+                 resolved_x: float,
                  server_count: int | None = None,
                  port_offset_by_pod: dict[str, int] | None = None) -> dict:
     """The config.json payload that goes into a role's ConfigMap.
+
+    resolved_x is the x value this role's formulas should evaluate at.
+    It's the template's x for source roles and the sum of upstream
+    role-total egress for downstream roles (see _compute_resolved_x).
 
     port_offset_by_pod maps each source pod's name to the iperf3 port
     offset it should use when connecting: actual_port = BASE + offset.
@@ -297,7 +379,7 @@ def _role_config(template: dict, role_name: str, peers: list[str],
     """
     role = template["roles"][role_name]
     cfg: dict = {
-        "x": template.get("x", 0),
+        "x": resolved_x,
         "cpu": role["cpu"],
         "ram": role["ram"],
         "net": role["net"],
@@ -384,6 +466,15 @@ def materialize(template: dict, source: str = SOURCE_HTTP) -> None:
     blueprint = _load_blueprint()
     template_annotation = json.dumps(template, separators=(",", ":"))
     fanin = _compute_fanin(template)
+    # x propagates through the role graph: source roles evaluate their
+    # formulas at the template's x, downstream roles at the sum of
+    # upstream role-total egress.  Computed once here and threaded
+    # through both phases so Phase 1's initial config and Phase 2's
+    # peer-IP patch agree.  validate() above already guarantees this
+    # won't raise (cycles are rejected there).
+    resolved_x = _compute_resolved_x(template)
+    log.info("Template %s: resolved x per role = %s",
+             name, {r: round(v, 3) for r, v in resolved_x.items()})
 
     # ─── Phase 1: create resources with empty peers ─────────────────────
     for role_name, role in template["roles"].items():
@@ -391,6 +482,7 @@ def materialize(template: dict, source: str = SOURCE_HTTP) -> None:
         docs = _render_role(blueprint, name, role_name, count, WORKER_IMAGE)
         config_payload = json.dumps(
             _role_config(template, role_name, [],
+                         resolved_x=resolved_x[role_name],
                          server_count=fanin[role_name] or None),
             indent=2,
         )
@@ -427,6 +519,7 @@ def materialize(template: dict, source: str = SOURCE_HTTP) -> None:
         cm_name = f"wt-{name}-{role_name}-config"
         config_payload = json.dumps(
             _role_config(template, role_name, peer_ips,
+                         resolved_x=resolved_x[role_name],
                          server_count=sc,
                          port_offset_by_pod=offsets_by_role[role_name] or None),
             indent=2,
@@ -439,6 +532,59 @@ def materialize(template: dict, source: str = SOURCE_HTTP) -> None:
         else:
             log.warning("Template %s: peer-IP patch on %s failed: %s",
                         name, cm_name, status)
+
+
+def _deep_merge(base: dict, patch: dict) -> dict:
+    """Recursively merge `patch` into a copy of `base`.
+
+    Dict values merge recursively; scalars and lists in `patch` replace
+    whatever's in `base`.  Neither input is mutated.  This is the merge
+    semantics used by PATCH /templates/<name>: a partial template like
+    `{"roles": {"middle": {"net": {"a": 0.3}}}}` updates just middle's
+    net.a while leaving net.b and every other field untouched.
+    """
+    result = dict(base)
+    for k, v in patch.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def patch_template(name: str, patch: dict) -> dict | None:
+    """Merge `patch` into the existing template `name` and re-materialize.
+
+    The merge is deep — see `_deep_merge` — so a patch only needs to
+    specify the fields that actually change.  The template's `name`
+    field is always taken from the URL parameter (any `name` in the
+    patch body is ignored).  The source annotation (http vs watch) is
+    preserved so a watch-managed template stays under watcher control
+    after a PATCH; the next labelled-ConfigMap reconciliation will still
+    overwrite it from the labelled-CM content, so callers PATCHing a
+    watch-managed template should usually also update the labelled CM.
+
+    Returns the merged template on success, or None if no template
+    named `name` exists.  Raises ValueError if the merged template
+    fails validation (including cycle detection), and RuntimeError if a
+    Kubernetes API call fails during re-materialization.  materialize()
+    is idempotent, so a partial failure leaves the cluster in a
+    well-defined state that a retry can recover.
+    """
+    info = get_managed(name)
+    if info is None or not info.get("template"):
+        return None
+    existing = info["template"]
+    source = info.get("source") or SOURCE_HTTP
+    # Strip name from the patch — the URL is the source of truth.
+    sanitized = {k: v for k, v in patch.items() if k != "name"}
+    merged = _deep_merge(existing, sanitized)
+    merged["name"] = name
+    validate(merged)
+    log.info("Patching template %s (source=%s) with: %s", name, source,
+             json.dumps(sanitized, separators=(",", ":")))
+    materialize(merged, source=source)
+    return merged
 
 
 def teardown(name: str) -> int:
