@@ -31,7 +31,8 @@ import psutil
 from prometheus_client import Gauge
 
 import loads
-from state import RAM_TOLERANCE_MB, STATE, STATE_LOCK
+from state import (RAM_TOLERANCE_MB, STATE, STATE_LOCK,
+                   PEER_EGRESS_MBPS, PEER_EGRESS_LOCK)
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,12 @@ ACTUAL_NET = Gauge("worker_actual_net_mbps",
                    "target correctly for all roles including middle-tier ones.")
 
 INPUT_X = Gauge("worker_input_x", "Current network input value x")
+
+PEER_EGRESS = Gauge("worker_peer_egress_mbps",
+                    "Measured egress to a specific peer IP (Mbps), parsed from "
+                    "the iperf3 client's per-second interval reports. One "
+                    "series per peer IP this pod is sending to.",
+                    ["peer"])
 
 
 def sum_rss_mb(proc: psutil.Process) -> float:
@@ -157,6 +164,10 @@ def sampler_loop(interval: float = 1.0) -> None:
     last_heartbeat = 0.0
     RAM_ADJUST_INTERVAL_S = 5.0
     HEARTBEAT_INTERVAL_S = 30.0
+
+    # Peer IPs we currently have a worker_peer_egress_mbps series for, so we
+    # can remove series for peers that vanish after a reconfigure.
+    published_peers: set[str] = set()
 
     # cpu_percent(None) returns CPU since the *previous* call on the same
     # Process object — the first call always returns 0.0. Cache children
@@ -312,5 +323,18 @@ def sampler_loop(interval: float = 1.0) -> None:
             else:
                 mbps = 0.0
             ACTUAL_NET.set(mbps)
+
+            # Publish measured per-peer egress and prune series for peers that
+            # disappeared (e.g. after a reconfigure changed the peer set).
+            with PEER_EGRESS_LOCK:
+                peer_snapshot = dict(PEER_EGRESS_MBPS)
+            for peer_ip, peer_mbps in peer_snapshot.items():
+                PEER_EGRESS.labels(peer=peer_ip).set(peer_mbps)
+            for stale in published_peers - peer_snapshot.keys():
+                try:
+                    PEER_EGRESS.remove(stale)
+                except KeyError:
+                    pass
+            published_peers = set(peer_snapshot.keys())
         except Exception:
             log.exception("sampler iteration failed; continuing")

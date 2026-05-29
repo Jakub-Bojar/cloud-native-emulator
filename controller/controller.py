@@ -26,6 +26,8 @@ POST   /templates          materialize a posted template
 GET    /templates          list names of currently materialized templates
 GET    /templates/<name>   inspect a materialized template (peers, replicas)
 DELETE /templates/<name>   tear down a materialized template
+GET    /graph/<name>       Grafana Node Graph payload (nodes + measured edges);
+                           ?view=pods for per-pod nodes (default: per-role)
 GET    /healthz            liveness for k8s
 """
 
@@ -34,8 +36,10 @@ import os
 import logging
 import urllib.request
 import urllib.error
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import graph
 import k8s
 import materializer
 import watcher
@@ -104,7 +108,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, {"templates": names})
         elif self.path.startswith("/templates/"):
-            name = self.path[len("/templates/"):]
+            name = urllib.parse.urlparse(self.path).path[len("/templates/"):]
             if "/" in name or not name:
                 self._send_json(400, {"error": "expected /templates/<name>"})
                 return
@@ -118,6 +122,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": f"no template named {name!r}"})
                 return
             self._send_json(200, info)
+        elif self.path.startswith("/graph/"):
+            parsed = urllib.parse.urlparse(self.path)
+            name = parsed.path[len("/graph/"):]
+            if "/" in name or not name:
+                self._send_json(400, {"error": "expected /graph/<name>"})
+                return
+            view = (urllib.parse.parse_qs(parsed.query).get("view", ["role"])[0] or "role").lower()
+            by_pod = view in ("pod", "pods")
+            try:
+                payload = graph.build_graph(name, by_pod=by_pod)
+            except Exception as e:
+                log.exception("build_graph failed")
+                self._send_json(502, {"error": str(e)})
+                return
+            if payload is None:
+                self._send_json(404, {"error": f"no template named {name!r}"})
+                return
+            self._send_json(200, payload)
         else:
             self._send(404, b'{"error":"not found"}')
 
@@ -181,10 +203,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         prefix = "/templates/"
-        if not (self.path.startswith(prefix) and len(self.path) > len(prefix)):
+        path = urllib.parse.urlparse(self.path).path
+        if not (path.startswith(prefix) and len(path) > len(prefix)):
             self._send(404, b'{"error":"not found"}')
             return
-        name = self.path[len(prefix):]
+        name = path[len(prefix):]
         if "/" in name or not name:
             self._send_json(400, {"error": "expected /templates/<name>"})
             return
@@ -225,8 +248,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         prefix = "/templates/"
-        if self.path.startswith(prefix) and len(self.path) > len(prefix):
-            name = self.path[len(prefix):]
+        path = urllib.parse.urlparse(self.path).path
+        if path.startswith(prefix) and len(path) > len(prefix):
+            name = path[len(prefix):]
             if "/" in name or not name:
                 self._send_json(400, {"error": "expected /templates/<name>"})
                 return

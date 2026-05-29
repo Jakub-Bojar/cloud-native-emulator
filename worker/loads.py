@@ -24,11 +24,11 @@ terminate them. PEER_SUPS holds the per-peer supervisor threads, paired
 with the Event that tells them to stop.
 """
 
-import hashlib
 import logging
 import math
 import mmap
 import os
+import re
 import shlex
 import signal
 import socket
@@ -37,7 +37,8 @@ import threading
 import time
 
 from state import (IPERF_BASE_PORT, IPERF_PORT_COUNT, PAGE_SIZE,
-                   POD_NAME, STATE, STATE_LOCK)
+                   STATE, STATE_LOCK,
+                   PEER_EGRESS_MBPS, PEER_EGRESS_LOCK)
 
 log = logging.getLogger(__name__)
 
@@ -125,29 +126,22 @@ def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
     return False
 
 
-def _port_for_pod(pod_name: str) -> int:
-    """Pick a stable iperf3 server port for this pod's outbound clients.
-
-    Hash the pod name into the [BASE_PORT, BASE_PORT+PORT_COUNT) range.
-    Different source pods → different ports → can hit the same target
-    pod's port pool simultaneously without colliding on the single-
-    session iperf3 server limit. Uses md5 (not Python's hash()) so the
-    choice is stable across pod restarts / different processes."""
-    h = int(hashlib.md5(pod_name.encode()).hexdigest()[:8], 16)
-    return IPERF_BASE_PORT + (h % IPERF_PORT_COUNT)
+# Matches the throughput column of an iperf3 interval line, e.g.
+#   [  5]   1.00-2.00   sec   245 KBytes  2.01 Mbits/sec
+_IPERF_RATE_RE = re.compile(r"([\d.]+)\s+([KMG]?)bits/sec")
+_IPERF_UNIT_TO_MBPS = {"": 1e-6, "K": 1e-3, "M": 1.0, "G": 1e3}
 
 
-def _parse_peer(peer: str) -> tuple[str, int]:
-    """Accept 'host' or 'host:port'. When no port is given, choose one
-    deterministically from our pod-name hash so the load distributes
-    across the target's port pool."""
-    host, sep, port_str = peer.partition(":")
-    if sep and port_str:
-        try:
-            return host, int(port_str)
-        except ValueError:
-            log.warning("invalid port in peer %r — falling back to hash", peer)
-    return host, _port_for_pod(POD_NAME)
+def _parse_iperf_interval_mbps(line: str) -> float | None:
+    """Per-interval throughput (Mbps) from one iperf3 stdout line, or None
+    for banner/header lines and the final sender/receiver summary rows."""
+    if "bits/sec" not in line or "sender" in line or "receiver" in line:
+        return None
+    m = _IPERF_RATE_RE.search(line)
+    if not m:
+        return None
+    value, unit = float(m.group(1)), m.group(2)
+    return value * _IPERF_UNIT_TO_MBPS.get(unit, 1.0)
 
 
 def _peer_client_supervisor(peer: str, mbps_per_peer: float,
@@ -181,21 +175,37 @@ def _peer_client_supervisor(peer: str, mbps_per_peer: float,
         "-b", f"{mbps_per_peer}M",
         "-t", "86400",                # iperf3's hard cap (24h)
         "--connect-timeout", "3000",  # ms; fail fast so the loop can retry
+        "-i", "1",                    # one interval report per second
+        "--forceflush",               # flush each report so we can read it live
     ]
     while not stop.is_set():
         log.info("peer iperf3 spawn: %s", shlex.join(cmd))
         try:
             proc = subprocess.Popen(cmd,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.STDOUT)
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
         except FileNotFoundError:
             log.error("iperf3 binary not found — peer supervisor exiting")
             return
-        # Poll for either the process to exit or the stop signal to fire.
-        while not stop.is_set():
-            if proc.poll() is not None:
-                break
-            stop.wait(0.5)
+        # Drain stdout line-by-line. This both yields live throughput AND
+        # avoids the page-cache drift a log file would cause — the bytes are
+        # consumed, not buffered. iperf3 emits a line every second, so the
+        # stop check fires within ~1s of being signalled.
+        try:
+            for line in proc.stdout:
+                if stop.is_set():
+                    break
+                mbps = _parse_iperf_interval_mbps(line)
+                if mbps is not None:
+                    with PEER_EGRESS_LOCK:
+                        PEER_EGRESS_MBPS[host] = mbps
+        except Exception:
+            log.exception("error reading iperf3 output for peer %s", host)
+        # Process ended or stop fired: this link is no longer sending, so
+        # publish 0 for it until/unless it comes back.
+        with PEER_EGRESS_LOCK:
+            PEER_EGRESS_MBPS[host] = 0.0
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
             try:
@@ -319,6 +329,10 @@ def _stop_peer_supervisors() -> None:
 def stop_current() -> None:
     global RAM_BUFFER
     _stop_peer_supervisors()
+    # Drop stale per-peer egress so a reconfigure with a new peer set doesn't
+    # leave dead IPs being republished by the sampler.
+    with PEER_EGRESS_LOCK:
+        PEER_EGRESS_MBPS.clear()
     for p in PROCS:
         if p.poll() is None:
             p.send_signal(signal.SIGTERM)

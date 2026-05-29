@@ -1,7 +1,20 @@
 # Cloud-Native Emulator Prototype
 
-A two-pod prototype for the EEECS summer research project
+A resource-emulation framework for the EEECS summer research project
 "High-Fidelity Emulation Framework for Cloud-Native Applications".
+
+> **Which mode am I looking at?** This README documents the **legacy
+> single-worker mode** (`POST /configure` driving one standalone worker) —
+> the original two-pod prototype. The system has since grown a **templated
+> multi-worker mode** that materializes whole role topologies and propagates
+> the input signal through the graph; that is now the primary API.
+>
+> For the templated mode (the recommended path), see:
+> - [ARCHITECTURE.md](ARCHITECTURE.md) — system diagrams and the x-propagation model
+> - [API.md](API.md) — the full HTTP API (`/templates`, `/graph`, worker endpoints)
+> - [RUNBOOK.md](RUNBOOK.md) — operational procedures
+>
+> The two modes are independent and can run side by side.
 
 ## Architecture
 
@@ -68,7 +81,10 @@ k8s-emulator/
 │   ├── Dockerfile
 │   └── controller.py
 ├── manifests/
-│   └── emulator.yaml
+│   ├── controller.yaml        # controller Deployment + Service + RBAC
+│   ├── worker.yaml            # legacy standalone worker + worker-config CM
+│   ├── worker-template.yaml   # blueprint the materializer renders per role
+│   └── monitoring.yaml        # Prometheus PodMonitor
 └── worker/
     ├── Dockerfile
     └── worker.py
@@ -115,15 +131,15 @@ cd ..
 Make sure both Docker Hub repos are **public**, or set up an
 `imagePullSecret` and reference it in the manifest.
 
-If you change your Docker Hub username, also update the two `image:` lines
-in `manifests/emulator.yaml`.
+If you change your Docker Hub username, also update the `image:` lines
+in `manifests/controller.yaml` and `manifests/worker.yaml`.
 
 ---
 
 ## Step 2 — Deploy to MicroK8s
 
 ```bash
-microk8s kubectl apply -f manifests/emulator.yaml
+microk8s kubectl apply -f manifests/controller.yaml -f manifests/worker.yaml
 microk8s kubectl get pods -w
 ```
 
@@ -279,7 +295,7 @@ cd worker && docker build -t jp36/emulator-worker:latest . && docker push jp36/e
 
 # force MicroK8s to pull the new image
 microk8s kubectl delete pod worker
-microk8s kubectl apply -f manifests/emulator.yaml
+microk8s kubectl apply -f manifests/worker.yaml
 ```
 
 The `delete pod` step is needed because the `:latest` tag is cached — even
@@ -291,7 +307,7 @@ new pull.
 ## Troubleshooting
 
 **`ImagePullBackOff`** — Image isn't on Docker Hub, the repo is private, or
-the image name in `manifests/emulator.yaml` doesn't match your Docker Hub
+the image name in `manifests/worker.yaml` doesn't match your Docker Hub
 username. Check with `microk8s kubectl describe pod worker`.
 
 **`localhost:30081` connection refused** — Either the pod isn't ready

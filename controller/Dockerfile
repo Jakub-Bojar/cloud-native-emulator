@@ -12,6 +12,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir pyyaml
 
 COPY controller/controller.py   /app/controller.py
+COPY controller/graph.py        /app/graph.py
 COPY controller/k8s.py          /app/k8s.py
 COPY controller/materializer.py /app/materializer.py
 COPY controller/watcher.py      /app/watcher.py

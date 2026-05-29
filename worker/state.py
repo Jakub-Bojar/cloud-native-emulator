@@ -45,6 +45,13 @@ STATE = {
     "peers": [],
 }
 
+# Measured per-peer egress (Mbps), keyed by peer IP. The iperf3 client
+# supervisors in loads.py write here as they parse interval reports; the
+# metrics sampler publishes it to the worker_peer_egress_mbps gauge. Guarded
+# by a lock because one supervisor thread writes per peer concurrently.
+PEER_EGRESS_MBPS: dict[str, float] = {}
+PEER_EGRESS_LOCK = threading.Lock()
+
 
 def linear(a: float, b: float, x: float) -> float:
     return max(0.0, a * x + b)
