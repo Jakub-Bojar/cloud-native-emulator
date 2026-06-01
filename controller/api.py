@@ -1,0 +1,408 @@
+"""
+Unified /api/v1 surface: query + control, in clean JSON.
+
+This is the per-VM "site API". One controller runs per VM, and each VM plays
+a role in a larger cloud system (edge / fog / cloud). Every response carries
+a `site` block ({"id", "tier"}) so that a future federation gateway can fan
+out to many controllers and merge their responses by site without any schema
+change here. SITE_ID / SITE_TIER are set per controller via env.
+
+Read endpoints fuse three data sources:
+  - Kubernetes live state (Deployments → desired replicas; Pods → phase,
+    readiness, restarts, node, age) via the k8s API.
+  - Instantaneous worker gauges scraped straight from each pod's /metrics
+    (reusing graph.scrape_topology — no Prometheus dependency).
+  - Historical time series via the Prometheus HTTP API (prom.py).
+
+Control endpoints (scaling) are a thin, validated wrapper over
+materializer.patch_template: changing a role's replica count re-resolves x
+through the graph and re-runs peer/port-offset assignment so freshly added
+pods are wired into the topology — not just a bare Deployment replica bump.
+
+The endpoint routing lives in controller.py; this module holds the logic.
+"""
+
+import json
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from urllib.parse import quote
+
+import graph
+import k8s
+import materializer
+import prom
+
+log = logging.getLogger(__name__)
+
+# Cap on replicas per role, to stop a typo from trying to schedule thousands
+# of pods. Overridable via env for bigger experiments.
+MAX_REPLICAS_PER_ROLE = int(os.environ.get("MAX_REPLICAS_PER_ROLE", "20"))
+
+# Worker Prometheus gauge name → friendly key used in our JSON responses.
+_GAUGE_MAP = {
+    "worker_input_x": "x",
+    "worker_target_cpu_millicores": "target_cpu_millicores",
+    "worker_actual_cpu_millicores": "actual_cpu_millicores",
+    "worker_target_ram_mb": "target_ram_mb",
+    "worker_actual_ram_mb": "actual_ram_mb",
+    "worker_target_net_mbps": "target_net_mbps",
+    "worker_actual_net_mbps": "actual_net_mbps",
+}
+
+
+def site_block() -> dict:
+    """Identity of this controller's site. Tags every response so a fleet-wide
+    gateway can attribute and merge data across VMs later."""
+    return {
+        "id": os.environ.get("SITE_ID", "local"),
+        "tier": os.environ.get("SITE_TIER", "unknown"),
+    }
+
+
+# ----------------------------------------------------------------------------
+# Kubernetes pod state
+# ----------------------------------------------------------------------------
+
+def _age_seconds(ts: str | None) -> int | None:
+    if not ts:
+        return None
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+        return int((datetime.now(timezone.utc) - dt).total_seconds())
+    except ValueError:
+        return None
+
+
+def _list_pods(name: str) -> dict[str, dict]:
+    """Live Pod state for template `name`, keyed by pod name.
+
+    Returns {pod_name: {role, phase, ready, restarts, node, ip, age_seconds}}.
+    Requires the controller Role to grant pods get/list (see
+    manifests/controller.yaml)."""
+    selector = (f"{materializer.MANAGED_BY_LABEL}={materializer.MANAGED_BY_VALUE}"
+                f",{materializer.TEMPLATE_LABEL}={name}")
+    path = (f"/api/v1/namespaces/{k8s.namespace()}/pods"
+            f"?labelSelector={quote(selector)}")
+    status, body = k8s.get(path)
+    out: dict[str, dict] = {}
+    if status != 200:
+        log.warning("list pods for %s: status=%s", name, status)
+        return out
+    for item in json.loads(body).get("items", []):
+        meta = item.get("metadata", {})
+        pod = meta.get("name")
+        if not pod:
+            continue
+        spec = item.get("spec", {})
+        st = item.get("status", {})
+        cs = st.get("containerStatuses") or []
+        restarts = sum(int(c.get("restartCount", 0)) for c in cs)
+        ready = all(c.get("ready", False) for c in cs) if cs else False
+        out[pod] = {
+            "role": (meta.get("labels", {}) or {}).get(materializer.ROLE_LABEL),
+            "phase": st.get("phase"),
+            "ready": ready,
+            "restarts": restarts,
+            "node": spec.get("nodeName"),
+            "ip": st.get("podIP"),
+            "age_seconds": _age_seconds(st.get("startTime")),
+        }
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Read endpoints
+# ----------------------------------------------------------------------------
+
+def overview() -> dict:
+    """Site-wide snapshot: every materialized template with per-role desired
+    vs ready replica counts and a pod health rollup. The single place to see
+    'what is running here'."""
+    templates: list[dict] = []
+    for nm in materializer.list_managed():
+        info = materializer.get_managed(nm)
+        if not info:
+            continue
+        desired = info.get("replicas", {}) or {}
+        pods = _list_pods(nm)
+        roles_summary: dict[str, dict] = {
+            role: {"desired": count, "ready": 0}
+            for role, count in desired.items()
+        }
+        total = ready_total = 0
+        for pd in pods.values():
+            total += 1
+            if pd["ready"]:
+                ready_total += 1
+            role = pd.get("role")
+            if role is None:
+                continue
+            roles_summary.setdefault(role, {"desired": 0, "ready": 0})
+            if pd["ready"]:
+                roles_summary[role]["ready"] += 1
+        templates.append({
+            "name": nm,
+            "source": info.get("source"),
+            "roles": roles_summary,
+            "pods": {"total": total, "ready": ready_total},
+        })
+    return {
+        "site": site_block(),
+        "namespace": k8s.namespace(),
+        "templates": templates,
+        "prometheus": prom.health(),
+    }
+
+
+def _pod_metrics(rec: dict) -> dict:
+    """Friendly-keyed metric snapshot from a scraped pod record."""
+    return {friendly: rec.get(gauge) for gauge, friendly in _GAUGE_MAP.items()}
+
+
+def template_status(name: str) -> dict | None:
+    """Rich per-template status: each role's desired/ready replicas, per-pod
+    k8s state fused with that pod's current worker gauges, role-level target
+    and actual sums, and measured role→role edge traffic. None if no such
+    template."""
+    topo = graph.scrape_topology(name)
+    if topo is None:
+        return None
+    roles = topo["roles"]
+    replicas = topo["replicas"]
+    pod_records = topo["pod_records"]
+    role_pods = topo["role_pods"]
+    k8s_pods = _list_pods(name)
+
+    scrapes_by_role: dict[str, list[dict]] = {r: [] for r in roles}
+    for rec in pod_records:
+        scrapes_by_role.setdefault(rec["role"], []).append(rec)
+    role_ips = {r: {ip for (_, ip) in pods} for r, pods in role_pods.items()}
+    edge_records = graph.measure_role_edges(topo["edges_def"],
+                                            scrapes_by_role, role_ips)
+
+    roles_out: dict[str, dict] = {}
+    for role in roles:
+        scrapes = scrapes_by_role.get(role, [])
+        scraped_names = {rec["pod"] for rec in scrapes}
+
+        def _sum(gauge: str) -> float:
+            return sum(rec.get(gauge, 0.0) or 0.0 for rec in scrapes)
+
+        pods_out: list[dict] = []
+        x_val = None
+        for rec in scrapes:
+            pod = rec["pod"]
+            kp = k8s_pods.get(pod, {})
+            metrics = _pod_metrics(rec)
+            if x_val is None:
+                x_val = metrics.get("x")
+            pods_out.append({
+                "name": pod,
+                "ip": rec.get("ip") or kp.get("ip"),
+                "node": kp.get("node"),
+                "phase": kp.get("phase"),
+                "ready": kp.get("ready", True),
+                "restarts": kp.get("restarts"),
+                "age_seconds": kp.get("age_seconds"),
+                "metrics": metrics,
+            })
+        # Pods that exist in k8s but aren't in Endpoints yet (starting up,
+        # not Ready) won't have been scraped — surface them so a scale-up in
+        # progress is visible rather than silently missing.
+        for pod, kp in k8s_pods.items():
+            if kp.get("role") == role and pod not in scraped_names:
+                pods_out.append({
+                    "name": pod,
+                    "ip": kp.get("ip"),
+                    "node": kp.get("node"),
+                    "phase": kp.get("phase"),
+                    "ready": kp.get("ready", False),
+                    "restarts": kp.get("restarts"),
+                    "age_seconds": kp.get("age_seconds"),
+                    "metrics": {},
+                })
+
+        roles_out[role] = {
+            "desired": int(replicas.get(role, len(pods_out))),
+            "ready": sum(1 for p in pods_out if p.get("ready")),
+            "x": x_val,
+            "targets": {
+                "cpu_millicores": _sum("worker_target_cpu_millicores"),
+                "ram_mb": _sum("worker_target_ram_mb"),
+                "net_mbps": _sum("worker_target_net_mbps"),
+            },
+            "actuals": {
+                "cpu_millicores": _sum("worker_actual_cpu_millicores"),
+                "ram_mb": _sum("worker_actual_ram_mb"),
+                "net_mbps": _sum("worker_actual_net_mbps"),
+            },
+            "pods": pods_out,
+        }
+
+    return {
+        "site": site_block(),
+        "name": name,
+        "source": (topo["info"] or {}).get("source"),
+        "roles": roles_out,
+        "edges": [{"from": r["source"], "to": r["target"],
+                   "mbps": round(r["mbps"], 3)} for r in edge_records],
+        "prometheus": {"available": None},  # not queried on this endpoint
+    }
+
+
+# ----------------------------------------------------------------------------
+# Summary: CPU / RAM / network averaged over a window
+# ----------------------------------------------------------------------------
+
+# resource key → (friendly output key + unit, actual gauge, target gauge).
+_RESOURCE_METRICS = {
+    "cpu": ("cpu_millicores", "worker_actual_cpu_millicores",
+            "worker_target_cpu_millicores"),
+    "ram": ("ram_mb", "worker_actual_ram_mb", "worker_target_ram_mb"),
+    "net": ("net_mbps", "worker_actual_net_mbps", "worker_target_net_mbps"),
+}
+_DURATION_RE = re.compile(r"^\d+[smhd]$")
+
+
+def _safe_duration(s: str) -> str:
+    """Only allow a bare Prometheus duration so it can be embedded in a
+    subquery range without injection. Falls back to 15m."""
+    return s if isinstance(s, str) and _DURATION_RE.match(s) else "15m"
+
+
+def _round(v):
+    return round(v, 3) if isinstance(v, (int, float)) else v
+
+
+def template_summary(name: str, range_str: str = "15m", resources=None,
+                     by_role: bool = False) -> dict | None:
+    """Compact CPU/RAM/network summary for a template, averaged over a window.
+
+    For each requested resource it reports the template-wide target and actual
+    *summed across pods*, then reduced over the window: actual gets avg / min /
+    max, target gets avg. With by_role=True it also breaks the per-resource
+    averages down by role. None if no such template; graceful degradation if
+    Prometheus is unreachable.
+
+    Raises ValueError on an unknown resource → caller maps to 400.
+    """
+    info = materializer.get_managed(name)
+    if info is None:
+        return None
+
+    if resources:
+        unknown = [r for r in resources if r not in _RESOURCE_METRICS]
+        if unknown:
+            raise ValueError(
+                f"unknown resource(s) {unknown}; valid: cpu, ram, net")
+        wanted = list(dict.fromkeys(resources))  # de-dupe, keep order
+    else:
+        wanted = ["cpu", "ram", "net"]
+
+    window = _safe_duration(range_str)
+    envelope = {
+        "site": site_block(),
+        "name": name,
+        "range": window,
+    }
+    if not prom.available():
+        envelope["prometheus"] = {"available": False, "url": prom.url()}
+        envelope["totals"] = {}
+        if by_role:
+            envelope["roles"] = {}
+        return envelope
+
+    ns = k8s.namespace()
+
+    def agg(metric: str, scope: str, fn: str):
+        # Sum across pods first, then reduce over time via a subquery so the
+        # number is "the whole role/template's usage, averaged over the window".
+        return _round(prom.instant_scalar(
+            f"{fn}(sum({metric}{{{scope}}})[{window}:])"))
+
+    def block(scope: str, full: bool) -> dict:
+        out: dict[str, dict] = {}
+        for r in wanted:
+            key, actual, target = _RESOURCE_METRICS[r]
+            entry = {
+                "target_avg": agg(target, scope, "avg_over_time"),
+                "actual_avg": agg(actual, scope, "avg_over_time"),
+            }
+            if full:
+                entry["actual_min"] = agg(actual, scope, "min_over_time")
+                entry["actual_max"] = agg(actual, scope, "max_over_time")
+            out[key] = entry
+        return out
+
+    envelope["totals"] = block(f'namespace="{ns}",pod=~"wt-{name}-.*"', full=True)
+    if by_role:
+        roles = (info.get("template") or {}).get("roles") or {}
+        envelope["roles"] = {
+            role: block(f'namespace="{ns}",pod=~"wt-{name}-{role}-.*"',
+                        full=False)
+            for role in roles
+        }
+    envelope["prometheus"] = {"available": True, "url": prom.url()}
+    return envelope
+
+
+# ----------------------------------------------------------------------------
+# Control endpoint: scale a role's replicas
+# ----------------------------------------------------------------------------
+
+def scale_role(name: str, role: str, replicas=None, delta=None) -> dict | None:
+    """Set a role's replica count (add/remove pods).
+
+    Exactly one of `replicas` (absolute) or `delta` (relative, e.g. +1/-1)
+    must be given. Implemented via materializer.patch_template so that
+    scaling re-resolves x through the role graph and re-runs peer/port-offset
+    assignment — added pods are fully wired into the topology, not just bare
+    replicas. Returns None if no such template.
+
+    Raises ValueError on bad input (unknown role, missing/both of
+    replicas|delta, out-of-range target) → caller maps to 400.
+    Raises RuntimeError if the k8s re-materialization fails → caller maps 502.
+    """
+    info = materializer.get_managed(name)
+    if info is None:
+        return None
+    template = info.get("template") or {}
+    roles = template.get("roles") or {}
+    if role not in roles:
+        raise ValueError(f"role {role!r} not in template {name!r}")
+
+    if (replicas is None) == (delta is None):
+        raise ValueError("provide exactly one of 'replicas' or 'delta'")
+
+    current = int(roles[role].get("count", 1))
+    if replicas is not None:
+        if not isinstance(replicas, int) or isinstance(replicas, bool):
+            raise ValueError("'replicas' must be an integer")
+        target = replicas
+    else:
+        if not isinstance(delta, int) or isinstance(delta, bool):
+            raise ValueError("'delta' must be an integer")
+        target = current + delta
+
+    if target < 1:
+        raise ValueError("replica count must be >= 1")
+    if target > MAX_REPLICAS_PER_ROLE:
+        raise ValueError(
+            f"replica count {target} exceeds cap {MAX_REPLICAS_PER_ROLE} "
+            f"(raise MAX_REPLICAS_PER_ROLE to override)")
+
+    log.info("Scaling %s/%s: %d → %d", name, role, current, target)
+    merged = materializer.patch_template(name, {"roles": {role: {"count": target}}})
+    if merged is None:
+        return None
+    return {
+        "site": site_block(),
+        "name": name,
+        "role": role,
+        "previous": current,
+        "replicas": target,
+        "peers": materializer.compute_peers(merged),
+    }

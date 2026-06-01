@@ -92,15 +92,22 @@ def _arc(act_cpu: float, tgt_cpu: float) -> float:
     return max(0.0, min(1.0, act_cpu / tgt_cpu)) if tgt_cpu > 0 else 0.0
 
 
-def build_graph(name: str, by_pod: bool = False) -> dict | None:
-    """Build the Node Graph payload for template `name`, or None if there is
-    no such materialized template.
+def scrape_topology(name: str) -> dict | None:
+    """Resolve and scrape every pod of template `name` exactly once.
 
-    by_pod=False → one node per role (stats summed across the role's pods),
-    edges are role→role with the measured traffic summed per edge.
+    This is the shared data-collection step behind both the Grafana node
+    graph (build_graph) and the /api/v1 status endpoint (api.py). Returns
+    None if no such template is materialized. Otherwise returns a dict with:
 
-    by_pod=True  → one node per pod, edges are the raw pod→pod links straight
-    from worker_peer_egress_mbps{peer="<ip>"}.
+      info          the materializer.get_managed() record
+      template      the parsed template
+      roles         role_name → role spec
+      edges_def     the template's edge list
+      replicas      role_name → desired replica count (from the Deployment)
+      role_pods     role_name → [(pod_name, ip), ...] from Service Endpoints
+      ip_index      pod_ip → (role_name, pod_name)
+      pod_records   one dict per ready pod: {role, pod, ip, <gauges>, peer_egress}
+      color_by_role role_name → palette color (stable across requests/views)
     """
     info = materializer.get_managed(name)
     if info is None:
@@ -132,22 +139,28 @@ def build_graph(name: str, by_pod: bool = False) -> dict | None:
     color_by_role = {role: _PALETTE[i % len(_PALETTE)]
                      for i, role in enumerate(roles)}
 
-    if by_pod:
-        return _pod_graph(pod_records, ip_index, color_by_role)
-    return _role_graph(roles, edges_def, replicas, role_pods, pod_records,
-                       color_by_role)
+    return {
+        "info": info,
+        "template": template,
+        "roles": roles,
+        "edges_def": edges_def,
+        "replicas": replicas,
+        "role_pods": role_pods,
+        "ip_index": ip_index,
+        "pod_records": pod_records,
+        "color_by_role": color_by_role,
+    }
 
 
-def _role_graph(roles: dict, edges_def: list, replicas: dict,
-                role_pods: dict[str, list[tuple[str, str]]],
-                pod_records: list[dict],
-                color_by_role: dict[str, str]) -> dict:
-    scrapes_by_role: dict[str, list[dict]] = {r: [] for r in roles}
-    for rec in pod_records:
-        scrapes_by_role[rec["role"]].append(rec)
-    role_ips = {r: {ip for (_, ip) in pods} for r, pods in role_pods.items()}
+def measure_role_edges(edges_def: list,
+                       scrapes_by_role: dict[str, list[dict]],
+                       role_ips: dict[str, set[str]]) -> list[dict]:
+    """Measured role→role traffic, summed per edge.
 
-    # Edges first (measured from→to) so each node can carry its in/out totals.
+    For each edge from→to, sum the worker_peer_egress_mbps reported by every
+    `from` pod toward IPs that belong to the `to` role. Shared by the node
+    graph and the /api/v1 status endpoint. Returns a list of
+    {"source", "target", "mbps"} records, de-duplicated per (from, to)."""
     edge_records: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for e in edges_def:
@@ -162,6 +175,41 @@ def _role_graph(roles: dict, edges_def: list, replicas: dict,
                 if peer_ip in dst_ips:
                     measured += mbps
         edge_records.append({"source": src, "target": dst, "mbps": measured})
+    return edge_records
+
+
+def build_graph(name: str, by_pod: bool = False) -> dict | None:
+    """Build the Node Graph payload for template `name`, or None if there is
+    no such materialized template.
+
+    by_pod=False → one node per role (stats summed across the role's pods),
+    edges are role→role with the measured traffic summed per edge.
+
+    by_pod=True  → one node per pod, edges are the raw pod→pod links straight
+    from worker_peer_egress_mbps{peer="<ip>"}.
+    """
+    topo = scrape_topology(name)
+    if topo is None:
+        return None
+    if by_pod:
+        return _pod_graph(topo["pod_records"], topo["ip_index"],
+                          topo["color_by_role"])
+    return _role_graph(topo["roles"], topo["edges_def"], topo["replicas"],
+                       topo["role_pods"], topo["pod_records"],
+                       topo["color_by_role"])
+
+
+def _role_graph(roles: dict, edges_def: list, replicas: dict,
+                role_pods: dict[str, list[tuple[str, str]]],
+                pod_records: list[dict],
+                color_by_role: dict[str, str]) -> dict:
+    scrapes_by_role: dict[str, list[dict]] = {r: [] for r in roles}
+    for rec in pod_records:
+        scrapes_by_role[rec["role"]].append(rec)
+    role_ips = {r: {ip for (_, ip) in pods} for r, pods in role_pods.items()}
+
+    # Edges first (measured from→to) so each node can carry its in/out totals.
+    edge_records = measure_role_edges(edges_def, scrapes_by_role, role_ips)
 
     out_by_role: dict[str, float] = {r: 0.0 for r in roles}
     in_by_role: dict[str, float] = {r: 0.0 for r in roles}

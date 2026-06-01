@@ -1,0 +1,832 @@
+openapi: 3.0.3
+
+# ============================================================================
+# Cloud-Native Emulator — Controller API
+# ============================================================================
+# Machine-readable companion to API.md. Load this into Swagger UI / Redoc, or
+# feed it to openapi-generator to produce a typed client:
+#
+#   # Browse interactively
+#   npx @redocly/cli preview-docs openapi.yaml
+#   docker run -p 8088:8080 -e SWAGGER_JSON=/spec/openapi.yaml \
+#     -v "$PWD:/spec" swaggerapi/swagger-ui
+#
+#   # Generate a client (e.g. python)
+#   openapi-generator-cli generate -i openapi.yaml -g python -o ./client
+#
+# Worker pods expose their own small API (/healthz, /status, /metrics on
+# :8080) reached via `kubectl port-forward` — that is a different service and
+# is documented in API.md, not here, to keep this spec to one server.
+# ============================================================================
+
+info:
+  title: Cloud-Native Emulator — Controller API
+  version: "1.0.0"
+  description: |
+    HTTP API for the per-VM emulator controller. The controller materializes
+    Kubernetes topologies ("templates") of synthetic-load worker pods, and
+    exposes a unified `/api/v1` surface to observe and scale them.
+
+    **Four surfaces:**
+    - **Templated mode** (`/templates*`) — the write API: create / inspect /
+      patch / delete whole topologies. Validates the role graph, computes
+      resolved `x` per role, and materializes one Deployment + ConfigMap +
+      Service per role.
+    - **Unified site API** (`/api/v1/*`) — the read + scale API. Every
+      response carries a `site` block (`{id, tier}`) so a future federation
+      gateway can fan out across edge/fog/cloud VMs and merge by site.
+    - **Health** (`/healthz`).
+    - **Legacy single-worker mode** (`/configure`, `/stop`, `/status`) —
+      pre-template compatibility against `manifests/worker.yaml`.
+
+    **No authentication.** Reachability is the only gate; do not expose the
+    NodePort publicly.
+
+    **Stateless.** Every read is reconstructed from Kubernetes state and live
+    pod scrapes — the controller holds no in-memory state.
+  license:
+    name: See repository
+
+servers:
+  - url: http://{host}:{port}
+    description: Controller NodePort
+    variables:
+      host:
+        default: "192.168.2.2"
+        description: MicroK8s host IP
+      port:
+        default: "30081"
+        description: NodePort for controller-service
+
+tags:
+  - name: templates
+    description: Write API — create, inspect, patch, and delete topologies.
+  - name: site-api
+    description: Unified read + scale API. Responses carry a `site` block.
+  - name: health
+    description: Liveness.
+  - name: legacy
+    description: Pre-template single-worker compatibility endpoints.
+
+paths:
+  # --------------------------------------------------------------------------
+  # Templated mode
+  # --------------------------------------------------------------------------
+  /templates:
+    post:
+      tags: [templates]
+      summary: Create (materialize) a topology
+      description: |
+        Validates the template (schema + role-graph cycle detection), computes
+        the resolved `x` for each role via topological propagation, then
+        creates one Deployment + ConfigMap + Service per role using two-phase
+        materialization. Idempotent: re-POSTing the same `name` updates the
+        existing resources via PATCH.
+      operationId: createTemplate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TemplateBody'
+            examples:
+              webstack:
+                $ref: '#/components/examples/WebstackTemplate'
+      responses:
+        '201':
+          description: Materialized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterializeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '502':
+          $ref: '#/components/responses/UpstreamFailure'
+        '500':
+          $ref: '#/components/responses/ServerError'
+    get:
+      tags: [templates]
+      summary: List materialized templates
+      operationId: listTemplates
+      responses:
+        '200':
+          description: Names of all currently materialized templates.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TemplateList'
+
+  /templates/{name}:
+    parameters:
+      - $ref: '#/components/parameters/TemplateName'
+    get:
+      tags: [templates]
+      summary: Inspect a template
+      description: |
+        Reconstructed from ConfigMap annotations and live Deployment replica
+        counts — there is no in-memory state on the controller.
+      operationId: getTemplate
+      responses:
+        '200':
+          description: Reconstructed template state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TemplateInspect'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [templates]
+      summary: Partially update a template
+      description: |
+        Deep-merges the patch into the live template, re-validates (including
+        cycle detection), and re-materializes. Dicts merge recursively;
+        scalars and lists replace. Workers reload within ~60s — no pod
+        restart. The `name` field in the body is ignored (URL wins).
+
+        Caveat: if the template's `source` is `watch`, the labelled-ConfigMap
+        watcher will overwrite this patch within ~10s — edit the labelled
+        ConfigMap instead.
+      operationId: patchTemplate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TemplatePatch'
+            examples:
+              changeX:
+                summary: Recascade the whole topology
+                value: {"x": 20}
+              tuneRam:
+                summary: Tune one role's RAM (no cascade)
+                value: {"roles": {"api": {"ram": {"b": 512}}}}
+      responses:
+        '200':
+          description: Patched.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          $ref: '#/components/responses/UpstreamFailure'
+        '500':
+          $ref: '#/components/responses/ServerError'
+    delete:
+      tags: [templates]
+      summary: Tear down a template
+      description: |
+        Deletes every resource labelled with this template name: Deployments
+        first (so pods stop using the ConfigMap), then Services, then
+        ConfigMaps. Returns 200 even if some kinds were already absent.
+      operationId: deleteTemplate
+      responses:
+        '200':
+          description: Torn down.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteResponse'
+
+  # --------------------------------------------------------------------------
+  # Unified site API
+  # --------------------------------------------------------------------------
+  /api/v1/overview:
+    get:
+      tags: [site-api]
+      summary: Site-wide snapshot
+      description: |
+        Every materialized template with per-role desired/ready replica counts
+        and a pod-health rollup. Live (does not depend on Prometheus).
+      operationId: overview
+      responses:
+        '200':
+          description: Site overview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Overview'
+
+  /api/v1/templates/{name}/status:
+    parameters:
+      - $ref: '#/components/parameters/TemplateName'
+    get:
+      tags: [site-api]
+      summary: Deep live status for one template
+      description: |
+        Fuses Kubernetes pod state, live `/metrics` scrapes, and measured
+        role→role edge traffic. `prometheus.available` is always `null` here —
+        this endpoint reads live scrapes, not Prometheus. Pods that exist in
+        k8s but are not yet scraped (starting up, not in Endpoints) appear with
+        an empty `metrics` object.
+      operationId: templateStatus
+      responses:
+        '200':
+          description: Fused live status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/templates/{name}/summary:
+    parameters:
+      - $ref: '#/components/parameters/TemplateName'
+      - name: range
+        in: query
+        description: Window length as a bare Prometheus duration (s/m/h/d). Invalid values fall back to 15m.
+        required: false
+        schema:
+          type: string
+          default: "15m"
+        example: "1h"
+      - name: resources
+        in: query
+        description: Comma-separated subset of resources to include.
+        required: false
+        schema:
+          type: string
+          default: "cpu,ram,net"
+        example: "cpu,net"
+      - name: by_role
+        in: query
+        description: If true, add a per-role breakdown (averages only).
+        required: false
+        schema:
+          type: boolean
+          default: false
+    get:
+      tags: [site-api]
+      summary: CPU/RAM/network summary averaged over a window
+      description: |
+        Compact digest of CPU, RAM, and network for a template, averaged over
+        a window. Each resource reports the template-wide target and actual
+        summed across pods then reduced over time (actual: avg/min/max,
+        target: avg). With `by_role=true`, also breaks the averages down by
+        role. Graceful degradation: if Prometheus is unreachable, returns 200
+        with `prometheus.available: false` and empty `totals`. For a live
+        (no-Prometheus) alternative, use the status endpoint.
+      operationId: templateSummary
+      responses:
+        '200':
+          description: Resource summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SummaryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/templates/{name}/roles/{role}/scale:
+    parameters:
+      - $ref: '#/components/parameters/TemplateName'
+      - name: role
+        in: path
+        required: true
+        description: Role within the template.
+        schema:
+          type: string
+    post:
+      tags: [site-api]
+      summary: Scale a role (add/remove pods)
+      description: |
+        Provide exactly one of `replicas` (absolute) or `delta` (relative).
+        Implemented over `PATCH /templates/{name}`, so scaling re-resolves `x`
+        through the graph and re-runs peer/port-offset assignment — added pods
+        are fully wired into the topology, not bare replicas. Target must be
+        `>= 1` and `<= MAX_REPLICAS_PER_ROLE` (default 20).
+      operationId: scaleRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScaleRequest'
+            examples:
+              absolute:
+                summary: Set to 5 pods
+                value: {"replicas": 5}
+              relative:
+                summary: Add one pod
+                value: {"delta": 1}
+      responses:
+        '200':
+          description: Scaled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScaleResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          $ref: '#/components/responses/UpstreamFailure'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  # --------------------------------------------------------------------------
+  # Health
+  # --------------------------------------------------------------------------
+  /healthz:
+    get:
+      tags: [health]
+      summary: Controller liveness
+      operationId: healthz
+      responses:
+        '200':
+          description: Server is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  # --------------------------------------------------------------------------
+  # Legacy single-worker mode
+  # --------------------------------------------------------------------------
+  /configure:
+    post:
+      tags: [legacy]
+      summary: Configure the legacy single worker
+      description: Writes the payload into the `worker-config` ConfigMap.
+      operationId: legacyConfigure
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigureRequest'
+      responses:
+        '200':
+          description: Applied.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /stop:
+    post:
+      tags: [legacy]
+      summary: Stop the legacy single worker
+      description: Writes an all-zero config into `worker-config`.
+      operationId: legacyStop
+      responses:
+        '200':
+          description: Stopped.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /status:
+    get:
+      tags: [legacy]
+      summary: Proxy the legacy worker's status
+      operationId: legacyStatus
+      responses:
+        '200':
+          description: Legacy worker state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LegacyStatus'
+        '502':
+          $ref: '#/components/responses/UpstreamFailure'
+
+components:
+  parameters:
+    TemplateName:
+      name: name
+      in: path
+      required: true
+      description: Template name (lowercase letters, digits, and hyphens).
+      schema:
+        type: string
+        pattern: '^[a-z0-9-]+$'
+      example: webstack
+
+  responses:
+    BadRequest:
+      description: Invalid JSON, validation failure, or a cycle in the role graph.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: No template by that name.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UpstreamFailure:
+      description: A Kubernetes (or Prometheus) API call failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServerError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  examples:
+    WebstackTemplate:
+      summary: Six-role web stack
+      value:
+        name: webstack
+        x: 12
+        roles:
+          gateway: {count: 2, cpu: {a: 5, b: 60}, ram: {a: 2, b: 48}, net: {a: 0.2, b: 1}}
+          auth:    {count: 2, cpu: {a: 8, b: 50}, ram: {a: 3, b: 40}, net: {a: 0.1, b: 0.5}}
+          api:     {count: 3, cpu: {a: 12, b: 80}, ram: {a: 4, b: 50}, net: {a: 0.3, b: 1}}
+          queue:   {count: 1, cpu: {a: 10, b: 70}, ram: {a: 5, b: 64}, net: {a: 0.2, b: 0}}
+          cache:   {count: 2, cpu: {a: 6, b: 60}, ram: {a: 12, b: 96}, net: {a: 0.15, b: 0}}
+          db:      {count: 1, cpu: {a: 15, b: 120}, ram: {a: 8, b: 128}, net: {a: 0, b: 0}}
+        edges:
+          - {from: gateway, to: auth}
+          - {from: gateway, to: api}
+          - {from: api, to: queue}
+          - {from: api, to: cache}
+          - {from: auth, to: db}
+          - {from: queue, to: db}
+          - {from: cache, to: db}
+
+  schemas:
+    Formula:
+      type: object
+      description: Linear coefficients; the metric target is `a * x_role + b`.
+      required: [a, b]
+      properties:
+        a: {type: number}
+        b: {type: number}
+    PartialFormula:
+      type: object
+      description: Partial coefficients for PATCH (deep-merged).
+      properties:
+        a: {type: number}
+        b: {type: number}
+
+    RoleSpec:
+      type: object
+      required: [count, cpu, ram, net]
+      properties:
+        count:
+          type: integer
+          minimum: 1
+          description: Number of replicas for this role.
+        cpu:
+          allOf:
+            - $ref: '#/components/schemas/Formula'
+          description: CPU target in millicores.
+        ram:
+          allOf:
+            - $ref: '#/components/schemas/Formula'
+          description: RAM target in MB.
+        net:
+          allOf:
+            - $ref: '#/components/schemas/Formula'
+          description: Per-pod egress target in Mbps.
+    PartialRoleSpec:
+      type: object
+      properties:
+        count: {type: integer, minimum: 1}
+        cpu: {$ref: '#/components/schemas/PartialFormula'}
+        ram: {$ref: '#/components/schemas/PartialFormula'}
+        net: {$ref: '#/components/schemas/PartialFormula'}
+
+    Edge:
+      type: object
+      required: [from, to]
+      properties:
+        from: {type: string, description: Source role.}
+        to: {type: string, description: Target role.}
+
+    TemplateBody:
+      type: object
+      required: [name, x, roles]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-z0-9-]+$'
+          description: k8s name; resources become `wt-<name>-<role>`.
+        x:
+          type: number
+          description: The input signal that drives the topology.
+        roles:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            $ref: '#/components/schemas/RoleSpec'
+          description: Map of role name → role spec.
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/Edge'
+
+    TemplatePatch:
+      type: object
+      description: Partial template; deep-merged into the live template.
+      properties:
+        x: {type: number}
+        roles:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/PartialRoleSpec'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/Edge'
+
+    MaterializeResponse:
+      type: object
+      properties:
+        name: {type: string}
+        roles:
+          type: array
+          items: {type: string}
+        peers:
+          $ref: '#/components/schemas/PeerMap'
+
+    TemplateList:
+      type: object
+      properties:
+        templates:
+          type: array
+          items: {type: string}
+
+    TemplateInspect:
+      type: object
+      properties:
+        name: {type: string}
+        source:
+          type: string
+          enum: [http, watch]
+        template:
+          $ref: '#/components/schemas/TemplateBody'
+        peers:
+          $ref: '#/components/schemas/PeerMap'
+        replicas:
+          type: object
+          additionalProperties: {type: integer}
+        configmaps:
+          type: array
+          items: {type: string}
+
+    PatchResponse:
+      type: object
+      properties:
+        name: {type: string}
+        template:
+          $ref: '#/components/schemas/TemplateBody'
+        peers:
+          $ref: '#/components/schemas/PeerMap'
+
+    DeleteResponse:
+      type: object
+      properties:
+        name: {type: string}
+        deleted:
+          type: integer
+          description: Approximate count of Kubernetes objects removed.
+
+    PeerMap:
+      type: object
+      description: Role → list of peer Service names.
+      additionalProperties:
+        type: array
+        items: {type: string}
+
+    Site:
+      type: object
+      description: Identity of the controller's site, for fleet federation.
+      properties:
+        id: {type: string, example: local}
+        tier: {type: string, example: unknown}
+
+    PrometheusHealth:
+      type: object
+      properties:
+        available:
+          type: boolean
+          nullable: true
+          description: >-
+            true/false on metrics endpoints; null on /status (not queried).
+        url: {type: string}
+
+    Overview:
+      type: object
+      properties:
+        site: {$ref: '#/components/schemas/Site'}
+        namespace: {type: string}
+        templates:
+          type: array
+          items: {$ref: '#/components/schemas/OverviewTemplate'}
+        prometheus: {$ref: '#/components/schemas/PrometheusHealth'}
+
+    OverviewTemplate:
+      type: object
+      properties:
+        name: {type: string}
+        source:
+          type: string
+          enum: [http, watch]
+          nullable: true
+        roles:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              desired: {type: integer}
+              ready: {type: integer}
+        pods:
+          type: object
+          properties:
+            total: {type: integer}
+            ready: {type: integer}
+
+    ResourceTriplet:
+      type: object
+      properties:
+        cpu_millicores: {type: number}
+        ram_mb: {type: number}
+        net_mbps: {type: number}
+
+    PodMetrics:
+      type: object
+      description: >-
+        Friendly-keyed worker gauges. Empty ({}) for pods not yet scraped.
+        Values may be null if a gauge is missing.
+      properties:
+        x: {type: number, nullable: true}
+        target_cpu_millicores: {type: number, nullable: true}
+        actual_cpu_millicores: {type: number, nullable: true}
+        target_ram_mb: {type: number, nullable: true}
+        actual_ram_mb: {type: number, nullable: true}
+        target_net_mbps: {type: number, nullable: true}
+        actual_net_mbps: {type: number, nullable: true}
+
+    PodStatus:
+      type: object
+      properties:
+        name: {type: string}
+        ip: {type: string, nullable: true}
+        node: {type: string, nullable: true}
+        phase: {type: string, nullable: true}
+        ready: {type: boolean}
+        restarts: {type: integer, nullable: true}
+        age_seconds: {type: integer, nullable: true}
+        metrics: {$ref: '#/components/schemas/PodMetrics'}
+
+    RoleStatus:
+      type: object
+      properties:
+        desired: {type: integer}
+        ready: {type: integer}
+        x: {type: number, nullable: true}
+        targets: {$ref: '#/components/schemas/ResourceTriplet'}
+        actuals: {$ref: '#/components/schemas/ResourceTriplet'}
+        pods:
+          type: array
+          items: {$ref: '#/components/schemas/PodStatus'}
+
+    MeasuredEdge:
+      type: object
+      properties:
+        from: {type: string}
+        to: {type: string}
+        mbps: {type: number}
+
+    StatusResponse:
+      type: object
+      properties:
+        site: {$ref: '#/components/schemas/Site'}
+        name: {type: string}
+        source:
+          type: string
+          enum: [http, watch]
+          nullable: true
+        roles:
+          type: object
+          additionalProperties: {$ref: '#/components/schemas/RoleStatus'}
+        edges:
+          type: array
+          items: {$ref: '#/components/schemas/MeasuredEdge'}
+        prometheus: {$ref: '#/components/schemas/PrometheusHealth'}
+
+    ResourceSummaryFull:
+      type: object
+      description: Window-reduced totals for one resource (summed across pods).
+      properties:
+        target_avg: {type: number, nullable: true}
+        actual_avg: {type: number, nullable: true}
+        actual_min: {type: number, nullable: true}
+        actual_max: {type: number, nullable: true}
+
+    ResourceSummaryAvg:
+      type: object
+      description: Window-averaged target/actual for one resource.
+      properties:
+        target_avg: {type: number, nullable: true}
+        actual_avg: {type: number, nullable: true}
+
+    ResourceBlockFull:
+      type: object
+      description: Per-resource block keyed by friendly metric name.
+      properties:
+        cpu_millicores: {$ref: '#/components/schemas/ResourceSummaryFull'}
+        ram_mb: {$ref: '#/components/schemas/ResourceSummaryFull'}
+        net_mbps: {$ref: '#/components/schemas/ResourceSummaryFull'}
+
+    ResourceBlockAvg:
+      type: object
+      properties:
+        cpu_millicores: {$ref: '#/components/schemas/ResourceSummaryAvg'}
+        ram_mb: {$ref: '#/components/schemas/ResourceSummaryAvg'}
+        net_mbps: {$ref: '#/components/schemas/ResourceSummaryAvg'}
+
+    SummaryResponse:
+      type: object
+      properties:
+        site: {$ref: '#/components/schemas/Site'}
+        name: {type: string}
+        range: {type: string}
+        totals: {$ref: '#/components/schemas/ResourceBlockFull'}
+        roles:
+          type: object
+          description: Present only when by_role=true.
+          additionalProperties: {$ref: '#/components/schemas/ResourceBlockAvg'}
+        prometheus: {$ref: '#/components/schemas/PrometheusHealth'}
+
+    ScaleRequest:
+      type: object
+      description: Provide exactly one of `replicas` or `delta`.
+      oneOf:
+        - required: [replicas]
+        - required: [delta]
+      properties:
+        replicas:
+          type: integer
+          minimum: 1
+          description: Absolute target replica count.
+        delta:
+          type: integer
+          description: Relative change, e.g. 1 or -1.
+
+    ScaleResponse:
+      type: object
+      properties:
+        site: {$ref: '#/components/schemas/Site'}
+        name: {type: string}
+        role: {type: string}
+        previous: {type: integer}
+        replicas: {type: integer}
+        peers: {$ref: '#/components/schemas/PeerMap'}
+
+    ConfigureRequest:
+      type: object
+      required: [x, cpu, ram, net]
+      properties:
+        x: {type: number}
+        cpu: {$ref: '#/components/schemas/Formula'}
+        ram: {$ref: '#/components/schemas/Formula'}
+        net: {$ref: '#/components/schemas/Formula'}
+
+    LegacyStatus:
+      type: object
+      properties:
+        running: {type: boolean}
+        x: {type: number}
+        cpu_millicores: {type: number}
+        ram_mb: {type: number}
+        net_mbps: {type: number}
+        formulas:
+          type: object
+          properties:
+            cpu: {$ref: '#/components/schemas/Formula'}
+            ram: {$ref: '#/components/schemas/Formula'}
+            net: {$ref: '#/components/schemas/Formula'}
+        peers:
+          type: array
+          items: {type: string}
+
+    Health:
+      type: object
+      properties:
+        ok: {type: boolean}
+
+    Error:
+      type: object
+      properties:
+        error: {type: string}

@@ -166,6 +166,57 @@ curl -X POST http://192.168.2.2:30081/stop
 
 ---
 
+## Query & scale via the site API (`/api/v1`)
+
+The `/api/v1` surface is the one place to *observe everything* and to
+*add/remove pods* — clean JSON, every response tagged with this VM's
+`site` block (`SITE_ID` / `SITE_TIER`). Full schemas in `API.md`; the
+day-to-day commands:
+
+```bash
+# What is running on this VM right now?
+curl -s http://192.168.2.2:30081/api/v1/overview | python3 -m json.tool
+
+# Deep status of one template: per-role desired/ready, resolved x,
+# target vs actual sums, per-pod gauges, measured edge traffic.
+curl -s http://192.168.2.2:30081/api/v1/templates/fb/status | python3 -m json.tool
+
+# Compact CPU/RAM/net digest, averaged over a window (the "just the numbers" view)
+curl -s "http://192.168.2.2:30081/api/v1/templates/fb/summary?range=1h" | python3 -m json.tool
+# Just CPU, per-role, over 30m:
+curl -s "http://192.168.2.2:30081/api/v1/templates/fb/summary?range=30m&resources=cpu&by_role=true" \
+  | python3 -m json.tool
+```
+
+Scaling a role adds/removes pods *and* re-wires the topology (re-resolves
+x, re-assigns peers + iperf port offsets) — it is not a bare Deployment
+replica bump:
+
+```bash
+# Absolute: set backend to 4 pods
+curl -X POST http://192.168.2.2:30081/api/v1/templates/fb/roles/backend/scale \
+  -H 'Content-Type: application/json' -d '{"replicas": 4}'
+
+# Relative: add one frontend pod
+curl -X POST http://192.168.2.2:30081/api/v1/templates/fb/roles/frontend/scale \
+  -H 'Content-Type: application/json' -d '{"delta": 1}'
+```
+
+The replica cap is `MAX_REPLICAS_PER_ROLE` (default 20). After a
+scale-up, `…/status` shows new pods with empty `metrics: {}` until they
+become Ready and land in Endpoints — watch them fill in there.
+
+> If the template's `source == "watch"`, the ConfigMap watcher will
+> revert a scale within ~10s. Edit the labelled ConfigMap's `count`
+> instead (Mode B) for a sticky change.
+
+> The windowed `/summary` needs Prometheus reachable at `PROM_URL`. If
+> it isn't, it still returns 200 with `prometheus.available: false` and
+> empty `totals` — overview/status (live-scrape based) keep working
+> regardless.
+
+---
+
 ## Template authoring — math that conserves
 
 Network targets across an edge **must conserve traffic** or the actuals
@@ -399,7 +450,10 @@ microk8s kubectl delete -f manifests/worker.yaml      # if used
 
 ```
 controller/
-  controller.py     HTTP routes; legacy /configure + /templates CRUD
+  controller.py     HTTP routes; legacy /configure + /templates CRUD + /api/v1
+  api.py            unified /api/v1 site API: query (k8s+scrape+prom) + scale
+  prom.py           Prometheus HTTP API client (instant + range), graceful
+  graph.py          topology scrape + edge measurement (shared by /graph + api)
   materializer.py   template → resources, two-phase create + IP resolve
   watcher.py        polls labelled CMs, reconciles via materializer
   k8s.py            shared k8s API client

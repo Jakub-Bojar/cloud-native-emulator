@@ -46,6 +46,12 @@ rules:
   - apiGroups: [""]
     resources: ["endpoints"]
     verbs: ["get", "list"]
+  # Pods — read-only. The /api/v1 status + overview endpoints read live pod
+  # state (phase, readiness, restart count, node, age) to fuse with the
+  # scraped worker metrics.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
   # The Deployment per role.
   - apiGroups: ["apps"]
     resources: ["deployments"]
@@ -82,6 +88,18 @@ spec:
           value: "http://worker-service:8080"
         - name: CONFIGMAP_NAME
           value: "worker-config"
+        # Site identity — this controller's place in the larger cloud system.
+        # Every /api/v1 response carries {id, tier} so a future federation
+        # gateway can merge data across VMs. Set per VM (edge / fog / cloud).
+        - name: SITE_ID
+          value: "local"
+        - name: SITE_TIER
+          value: "unknown"
+        # Prometheus HTTP API base URL for time-series (/api/v1/.../metrics).
+        # Depends on your kube-prometheus-stack release/namespace — adjust to
+        # match. If unreachable, metrics endpoints degrade gracefully.
+        - name: PROM_URL
+          value: "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090"
       readinessProbe:
         httpGet: { path: /healthz, port: 8081 }
         periodSeconds: 2
