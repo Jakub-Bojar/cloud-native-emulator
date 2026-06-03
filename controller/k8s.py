@@ -1,10 +1,9 @@
 """
 Shared Kubernetes API client.
 
-Used by both the controller's HTTP handlers (for the legacy /configure
-flow that patches the single worker-config ConfigMap) and by the
-template materializer (for creating Deployments/ConfigMaps/Services
-dynamically from a template).
+Used by the template materialiser to create and patch
+Deployments/ConfigMaps/Services dynamically from a template, and by the
+/api/v1 read endpoints to list pods.
 
 Authenticates via the in-pod ServiceAccount token mounted at
 /var/run/secrets/kubernetes.io/serviceaccount/ and trusts the cluster CA

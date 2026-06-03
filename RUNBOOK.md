@@ -2,7 +2,7 @@
 
 Operational reference for the cloud-native emulator: build, deploy, drive,
 observe, debug, and tear down. Two ingestion paths (HTTP + declarative)
-share one materializer; both are covered here.
+share one materialiser; both are covered here.
 
 Run everything from the repo root. Replace `jp36` with your Docker Hub
 username and `192.168.2.2` with your MicroK8s host IP throughout. Pods
@@ -56,8 +56,6 @@ docker build --no-cache -t jp36/emulator-worker:latest worker/
 ```bash
 microk8s kubectl apply -f manifests/controller.yaml
 microk8s kubectl apply -f manifests/monitoring.yaml   # if using Prometheus Operator
-# Legacy single-worker is optional — only needed if you're using POST /configure:
-# microk8s kubectl apply -f manifests/worker.yaml
 ```
 
 > Do **not** `kubectl apply -f manifests/worker-template.yaml`. It's a
@@ -77,7 +75,7 @@ microk8s kubectl wait --for=condition=Ready pod/controller --timeout=120s
 
 ### After rebuilding the worker image
 
-Workers run inside Deployments managed by the materializer. The simplest
+Workers run inside Deployments managed by the materialiser. The simplest
 way to force a pull is to scale, or trigger a rollout:
 
 ```bash
@@ -93,7 +91,7 @@ curl -X DELETE http://192.168.2.2:30081/templates/<name>
 
 ---
 
-## Drive the system — three modes
+## Drive the system — two modes
 
 ### Mode A: HTTP templates (most flexible)
 
@@ -144,25 +142,13 @@ data:
 ```
 
 ```bash
-microk8s kubectl apply -f fb-template.yaml      # materializes within ~15s
-microk8s kubectl edit configmap fb              # live edit → watcher re-materializes
+microk8s kubectl apply -f fb-template.yaml      # materialises within ~15s
+microk8s kubectl edit configmap fb              # live edit → watcher re-materialises
 microk8s kubectl delete configmap fb            # watcher tears down entire topology
 ```
 
 The template's `name` comes from `metadata.name`. Any `name` field inside
 `template.json` is overwritten by the watcher.
-
-### Mode C: Legacy single-worker (POST /configure)
-
-Only if you have `manifests/worker.yaml` deployed alongside.
-
-```bash
-curl -X POST http://192.168.2.2:30081/configure \
-  -H 'Content-Type: application/json' \
-  -d '{"x":50,"cpu":{"a":10,"b":100},"ram":{"a":4,"b":64},"net":{"a":0.1,"b":1}}'
-curl http://192.168.2.2:30081/status
-curl -X POST http://192.168.2.2:30081/stop
-```
 
 ---
 
@@ -193,13 +179,9 @@ x, re-assigns peers + iperf port offsets) — it is not a bare Deployment
 replica bump:
 
 ```bash
-# Absolute: set backend to 4 pods
+# Set backend to 4 pods (absolute target)
 curl -X POST http://192.168.2.2:30081/api/v1/templates/fb/roles/backend/scale \
   -H 'Content-Type: application/json' -d '{"replicas": 4}'
-
-# Relative: add one frontend pod
-curl -X POST http://192.168.2.2:30081/api/v1/templates/fb/roles/frontend/scale \
-  -H 'Content-Type: application/json' -d '{"delta": 1}'
 ```
 
 The replica cap is `MAX_REPLICAS_PER_ROLE` (default 20). After a
@@ -275,7 +257,7 @@ microk8s kubectl logs controller --tail=20
 
 If the watcher line is missing, you're on a pre-Step-6 image — rebuild.
 
-### Inspect a materialized template
+### Inspect a materialised template
 
 ```bash
 microk8s kubectl get all,configmap -l template=<name>
@@ -283,7 +265,7 @@ curl -s http://192.168.2.2:30081/templates/<name> | python3 -m json.tool
 ```
 
 The GET endpoint reconstructs the template from cluster annotations —
-this is how you verify the materializer wrote the right metadata.
+this is how you verify the materialiser wrote the right metadata.
 
 ### Frontend's peer IPs (post Phase 2)
 
@@ -376,7 +358,7 @@ microk8s kubectl cp <pod>:/etc/emulator/config.json /tmp/config.json
 
 ### POST /templates returns 502
 
-A k8s API call failed mid-materialization. Resources created up to the
+A k8s API call failed mid-materialisation. Resources created up to the
 failure point still exist. Re-POST is idempotent (`_apply` falls back to
 PATCH on 409). Or `DELETE` the template to fully clean up.
 
@@ -384,7 +366,7 @@ PATCH on 409). Or `DELETE` the template to fully clean up.
 
 Phase 2 hasn't completed yet (the workers are still in their initial
 "empty peers" configure). Wait ~30s after POST and re-check. If it's
-persistent: check controller logs for `Materializing template <name>`
+persistent: check controller logs for `Materialising template <name>`
 and `wrote N peer IPs into …`.
 
 ### Worker CPU at full pod limit (e.g. 1000m) when target is much lower
@@ -408,7 +390,7 @@ microk8s kubectl get podmonitor      # expect: worker AND worker-templates
 
 ## Cleanup
 
-### Tear down everything materialized
+### Tear down everything materialised
 
 ```bash
 # All templates created via HTTP or watch
@@ -426,7 +408,6 @@ microk8s kubectl get configmap -l emulator.local/template=true -o name \
 ```bash
 microk8s kubectl delete -f manifests/controller.yaml
 microk8s kubectl delete -f manifests/monitoring.yaml
-microk8s kubectl delete -f manifests/worker.yaml      # if used
 ```
 
 ---
@@ -434,13 +415,24 @@ microk8s kubectl delete -f manifests/worker.yaml      # if used
 ## Known limitations
 
 - **Controller is a `Pod`** — convert to a Deployment for self-healing.
-- **stress-ng at low `--cpu-load`** is bursty by design. Use Grafana
-  `rate(…[1m])` for steady-state numbers; single-second snapshots vary.
+- **stress-ng CPU is approximate** — `--cpu-load` accuracy depends on
+  scheduler responsiveness, so actual CPU can differ from target and is
+  somewhat bursty. The worker passes `--cpu-load-slice` (env
+  `CPU_LOAD_SLICE_MS`, default 20ms) to break the duty cycle into fine
+  slices, which smooths it and tightens accuracy under contention.
+  Default is 40ms (a balance of smoothness and mean accuracy); lower it
+  (e.g. 20) for smoother still at a slightly larger under-bias, raise it
+  towards stress-ng's coarse default (`0`) for less overhead. For
+  steady-state numbers prefer the windowed `/summary` or Grafana
+  `rate(…[1m])` over single-second snapshots. Note the target tracks CPU
+  *time* (cgroup `usage_usec`), so CPU-frequency scaling doesn't skew it.
+  If a node is oversubscribed (sum of CPU targets > node cores), no knob
+  can make pods hit target — check `kubectl top node`.
 - **Endpoint enumeration is one-shot.** Phase 2 reads pod IPs at
-  materialize time. If backend pods restart (e.g. rollout, eviction),
+  materialise time. If backend pods restart (e.g. rollout, eviction),
   their new IPs aren't propagated — re-POST or re-apply the template.
 - **Template formulas must conserve traffic** (see "Template authoring"
-  above). The materializer doesn't validate conservation.
+  above). The materialiser doesn't validate conservation.
 - **`microk8s kubectl exec --`** is broken by the wrapper. Use
   port-forward or `kubectl cp` for in-pod inspection.
 
@@ -450,25 +442,23 @@ microk8s kubectl delete -f manifests/worker.yaml      # if used
 
 ```
 controller/
-  controller.py     HTTP routes; legacy /configure + /templates CRUD + /api/v1
+  controller.py     HTTP routes: /templates CRUD + /graph + /api/v1
   api.py            unified /api/v1 site API: query (k8s+scrape+prom) + scale
-  prom.py           Prometheus HTTP API client (instant + range), graceful
+  prom.py           Prometheus HTTP API client (instant queries), graceful
   graph.py          topology scrape + edge measurement (shared by /graph + api)
-  materializer.py   template → resources, two-phase create + IP resolve
-  watcher.py        polls labelled CMs, reconciles via materializer
+  materialiser.py   template → resources, two-phase create + IP resolve
+  watcher.py        polls labelled CMs, reconciles via materialiser
   k8s.py            shared k8s API client
   Dockerfile        builds from REPO ROOT (needs manifests/)
 worker/
   worker.py         entrypoint, configure() funnel
-  state.py          STATE dict, POD_NAME, IPERF_PORT_COUNT
+  state.py          STATE dict, POD_NAME, IPERF_PORT_COUNT, CPU_LOAD_SLICE_MS
   loads.py          stress-ng/mmap/iperf3 + per-peer supervisor threads
   metrics.py        cgroup-CPU sampler, prometheus gauges, RAM nudger
   watcher.py        filesystem watchdog on the mounted ConfigMap
 manifests/
   controller.yaml         RBAC + ServiceAccount + Pod + NodePort Service
-  worker.yaml             optional legacy single-worker Deployment
   worker-template.yaml    stencil baked into the controller image
-  monitoring.yaml         two PodMonitors (legacy + templated)
+  monitoring.yaml         PodMonitor for the templated worker pods
   grafana-dashboard.json  pod-agnostic dashboard
-Emulator-Architecture.docx  the visual walkthrough
 ```

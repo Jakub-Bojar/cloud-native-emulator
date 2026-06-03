@@ -9,7 +9,7 @@ for each of CPU, RAM, and Network, plus the input value x.
 The worker shells out to standard load generators:
   - CPU:     stress-ng
   - RAM:     anonymous mmap inside this process (deterministic RSS)
-  - Network: iperf3 (loopback server + rate-limited client)
+  - Network: iperf3 (server pool + per-peer rate-limited clients)
 
 A /status endpoint reports what the worker is currently doing, and
 /metrics exposes Prometheus gauges that Grafana scrapes.
@@ -57,19 +57,15 @@ def configure(payload: dict) -> None:
     cpu_a, cpu_b = float(payload["cpu"]["a"]), float(payload["cpu"]["b"])
     ram_a, ram_b = float(payload["ram"]["a"]), float(payload["ram"]["b"])
     net_a, net_b = float(payload["net"]["a"]), float(payload["net"]["b"])
-    # Distinguish "peers field absent" (legacy single-worker mode → loopback
-    # iperf3) from "peers field present but empty" (templated role with no
-    # outbound edges → keep the iperf3 server slot free for inbound peer
-    # connections from other roles; spawning a loopback client here would
-    # occupy the server and block all inbound traffic).
+    # A role's peers are the concrete pod IPs it sends iperf3 traffic to,
+    # written by the controller. Empty (or absent) means no outbound edges:
+    # the iperf3 server pool stays up for inbound peer connections, no client.
     raw_peers = payload.get("peers")
-    templated_mode = raw_peers is not None
     if raw_peers is not None and (
             not isinstance(raw_peers, list)
             or not all(isinstance(p, str) for p in raw_peers)):
         log.warning("peers field is not a list[str], ignoring: %r", raw_peers)
-        raw_peers = []
-        templated_mode = False
+        raw_peers = None
     peers = raw_peers or []
 
     cpu_millicores = linear(cpu_a, cpu_b, x)
@@ -80,12 +76,7 @@ def configure(payload: dict) -> None:
         log.info("Configured zero load — staying stopped")
         return
 
-    if peers:
-        mode_str = f"peers={peers}"
-    elif templated_mode:
-        mode_str = "peers=[] (templated, server-only)"
-    else:
-        mode_str = "peers=<loopback>"
+    mode_str = f"peers={peers}" if peers else "peers=[] (server-only)"
     log.info("Configuring x=%.2f → CPU=%.0fm, RAM=%.1fMB, NET=%.2fMbps %s",
              x, cpu_millicores, ram_mb, net_mbps, mode_str)
 
@@ -100,15 +91,14 @@ def configure(payload: dict) -> None:
     my_port_offset: int = int(port_offset_by_pod.get(POD_NAME, 0))
     if port_offset_by_pod:
         log.info("Port offset for this pod (%s): %d", POD_NAME, my_port_offset)
-    loads.start_network(net_mbps, peers, legacy_loopback=not templated_mode,
+    loads.start_network(net_mbps, peers,
                         server_count=server_count,
                         my_port_offset=my_port_offset)
-    # Loopback iperf3 reaches steady state within ~1 s. In peer mode the
-    # supervisor threads have just spawned their clients but the peer pods
-    # may still be coming up — we sleep the same 1 s anyway so the
-    # baseline measurement window below includes whatever traffic we can
-    # generate immediately; CPU subtraction stays correct as more peers
-    # come online (the sampler thread keeps the actual gauge live).
+    # Give the network a moment before sampling the baseline. The peer
+    # supervisor threads have just spawned their iperf3 clients but the peer
+    # pods may still be coming up — we sleep 1 s so the baseline window
+    # includes whatever traffic we can generate immediately; CPU subtraction
+    # stays correct as more peers come online (the sampler keeps the gauge live).
     time.sleep(1.0)
 
     # Sample CPU over a 1 s window to get a meaningful baseline_mc.
@@ -179,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/status":
             with STATE_LOCK:
                 self._send_json(200, dict(STATE))
-        elif self.path == "/healthz":
+        elif self.path == "/health":
             self._send_json(200, {"ok": True})
         elif self.path == "/metrics":
             body = generate_latest()

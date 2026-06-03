@@ -14,7 +14,7 @@ openapi: 3.0.3
 #   # Generate a client (e.g. python)
 #   openapi-generator-cli generate -i openapi.yaml -g python -o ./client
 #
-# Worker pods expose their own small API (/healthz, /status, /metrics on
+# Worker pods expose their own small API (/health, /status, /metrics on
 # :8080) reached via `kubectl port-forward` — that is a different service and
 # is documented in API.md, not here, to keep this spec to one server.
 # ============================================================================
@@ -23,21 +23,19 @@ info:
   title: Cloud-Native Emulator — Controller API
   version: "1.0.0"
   description: |
-    HTTP API for the per-VM emulator controller. The controller materializes
+    HTTP API for the per-VM emulator controller. The controller materialises
     Kubernetes topologies ("templates") of synthetic-load worker pods, and
     exposes a unified `/api/v1` surface to observe and scale them.
 
     **Four surfaces:**
     - **Templated mode** (`/templates*`) — the write API: create / inspect /
       patch / delete whole topologies. Validates the role graph, computes
-      resolved `x` per role, and materializes one Deployment + ConfigMap +
+      resolved `x` per role, and materialises one Deployment + ConfigMap +
       Service per role.
     - **Unified site API** (`/api/v1/*`) — the read + scale API. Every
       response carries a `site` block (`{id, tier}`) so a future federation
       gateway can fan out across edge/fog/cloud VMs and merge by site.
-    - **Health** (`/healthz`).
-    - **Legacy single-worker mode** (`/configure`, `/stop`, `/status`) —
-      pre-template compatibility against `manifests/worker.yaml`.
+    - **Health** (`/health`).
 
     **No authentication.** Reachability is the only gate; do not expose the
     NodePort publicly.
@@ -65,8 +63,6 @@ tags:
     description: Unified read + scale API. Responses carry a `site` block.
   - name: health
     description: Liveness.
-  - name: legacy
-    description: Pre-template single-worker compatibility endpoints.
 
 paths:
   # --------------------------------------------------------------------------
@@ -75,12 +71,12 @@ paths:
   /templates:
     post:
       tags: [templates]
-      summary: Create (materialize) a topology
+      summary: Create (materialise) a topology
       description: |
         Validates the template (schema + role-graph cycle detection), computes
         the resolved `x` for each role via topological propagation, then
         creates one Deployment + ConfigMap + Service per role using two-phase
-        materialization. Idempotent: re-POSTing the same `name` updates the
+        materialisation. Idempotent: re-POSTing the same `name` updates the
         existing resources via PATCH.
       operationId: createTemplate
       requestBody:
@@ -94,11 +90,11 @@ paths:
                 $ref: '#/components/examples/WebstackTemplate'
       responses:
         '201':
-          description: Materialized.
+          description: Materialised.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MaterializeResponse'
+                $ref: '#/components/schemas/MaterialiseResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '502':
@@ -107,11 +103,11 @@ paths:
           $ref: '#/components/responses/ServerError'
     get:
       tags: [templates]
-      summary: List materialized templates
+      summary: List materialised templates
       operationId: listTemplates
       responses:
         '200':
-          description: Names of all currently materialized templates.
+          description: Names of all currently materialised templates.
           content:
             application/json:
               schema:
@@ -141,9 +137,17 @@ paths:
       summary: Partially update a template
       description: |
         Deep-merges the patch into the live template, re-validates (including
-        cycle detection), and re-materializes. Dicts merge recursively;
-        scalars and lists replace. Workers reload within ~60s — no pod
-        restart. The `name` field in the body is ignored (URL wins).
+        cycle detection), and re-materialises. Workers reload within ~60s — no
+        pod restart. The `name` field in the body is ignored (URL wins).
+
+        You can change **any value**: the input `x`, a role's `cpu`/`ram`/`net`
+        coefficients, a role's `count`, or the `edges` list — and you can add
+        a new role. Pick an example below and edit it.
+
+        Merge rules: **dicts merge recursively** (so `{"roles":{"api":{"cpu":
+        {"a":15}}}}` touches only `api.cpu.a`); **scalars and lists replace**
+        (to change `edges`, send the whole new array). Deep-merge cannot delete
+        a key, so a role can't be removed via PATCH — DELETE + re-POST for that.
 
         Caveat: if the template's `source` is `watch`, the labelled-ConfigMap
         watcher will overwrite this patch within ~10s — edit the labelled
@@ -156,12 +160,54 @@ paths:
             schema:
               $ref: '#/components/schemas/TemplatePatch'
             examples:
+              skeleton:
+                summary: Full shape — keep the fields you want, delete the rest, edit the values
+                value:
+                  x: 12
+                  roles:
+                    api:
+                      count: 3
+                      cpu: {a: 12, b: 80}
+                      ram: {a: 4, b: 50}
+                      net: {a: 0.3, b: 1}
+                  edges:
+                    - {from: gateway, to: api}
               changeX:
-                summary: Recascade the whole topology
+                summary: Change the input signal (recascades x graph-wide)
                 value: {"x": 20}
+              tuneCpu:
+                summary: Change a role's CPU coefficients
+                value: {"roles": {"api": {"cpu": {"a": 15, "b": 80}}}}
               tuneRam:
-                summary: Tune one role's RAM (no cascade)
-                value: {"roles": {"api": {"ram": {"b": 512}}}}
+                summary: Change a role's RAM coefficients
+                value: {"roles": {"api": {"ram": {"a": 4, "b": 50}}}}
+              tuneNet:
+                summary: Change a role's network coefficients
+                value: {"roles": {"gateway": {"net": {"a": 0.3, "b": 2}}}}
+              scaleRole:
+                summary: Change a role's replica count (same as the scale endpoint)
+                value: {"roles": {"cache": {"count": 3}}}
+              replaceEdges:
+                summary: Replace the whole edge list (lists replace, not merge)
+                value: {"edges": [{"from": "gateway", "to": "api"}, {"from": "api", "to": "db"}]}
+              addRole:
+                summary: Add a new role (isolated unless you also add edges)
+                description: >-
+                  A role added without any edges is materialised but stays
+                  isolated from the traffic graph: with no inbound edge it is
+                  treated as a source (resolved x = template.x), so it runs
+                  real CPU and RAM load, but with no peers it sends no network
+                  traffic and nothing sends to it (net actual ≈ 0 regardless of
+                  its net formula). To wire it in, also change `edges` — and
+                  because lists REPLACE (not merge), send the **whole** edge
+                  list including the new edge(s), not just the new one.
+                value:
+                  roles:
+                    worker:
+                      count: 1
+                      cpu: {a: 5, b: 50}
+                      ram: {a: 2, b: 32}
+                      net: {a: 0.1, b: 0}
       responses:
         '200':
           description: Patched.
@@ -201,7 +247,7 @@ paths:
       tags: [site-api]
       summary: Site-wide snapshot
       description: |
-        Every materialized template with per-role desired/ready replica counts
+        Every materialised template with per-role desired/ready replica counts
         and a pod-health rollup. Live (does not depend on Prometheus).
       operationId: overview
       responses:
@@ -261,6 +307,13 @@ paths:
         schema:
           type: boolean
           default: false
+      - name: include_x
+        in: query
+        description: If true, add an `x` block mapping each role to its resolved input x.
+        required: false
+        schema:
+          type: boolean
+          default: false
     get:
       tags: [site-api]
       summary: CPU/RAM/network summary averaged over a window
@@ -269,8 +322,10 @@ paths:
         a window. Each resource reports the template-wide target and actual
         summed across pods then reduced over time (actual: avg/min/max,
         target: avg). With `by_role=true`, also breaks the averages down by
-        role. Graceful degradation: if Prometheus is unreachable, returns 200
-        with `prometheus.available: false` and empty `totals`. For a live
+        role. With `include_x=true`, adds an `x` block mapping each role to its
+        resolved input x (averaged — not summed — across the role's pods).
+        Graceful degradation: if Prometheus is unreachable, returns 200 with
+        `prometheus.available: false` and empty `totals`. For a live
         (no-Prometheus) alternative, use the status endpoint.
       operationId: templateSummary
       responses:
@@ -296,9 +351,9 @@ paths:
           type: string
     post:
       tags: [site-api]
-      summary: Scale a role (add/remove pods)
+      summary: Scale a role (set the replica count)
       description: |
-        Provide exactly one of `replicas` (absolute) or `delta` (relative).
+        Set a role's replica count to the absolute target `replicas`.
         Implemented over `PATCH /templates/{name}`, so scaling re-resolves `x`
         through the graph and re-runs peer/port-offset assignment — added pods
         are fully wired into the topology, not bare replicas. Target must be
@@ -311,12 +366,9 @@ paths:
             schema:
               $ref: '#/components/schemas/ScaleRequest'
             examples:
-              absolute:
-                summary: Set to 5 pods
+              setCount:
+                summary: Set the role to 5 pods
                 value: {"replicas": 5}
-              relative:
-                summary: Add one pod
-                value: {"delta": 1}
       responses:
         '200':
           description: Scaled.
@@ -336,11 +388,11 @@ paths:
   # --------------------------------------------------------------------------
   # Health
   # --------------------------------------------------------------------------
-  /healthz:
+  /health:
     get:
       tags: [health]
       summary: Controller liveness
-      operationId: healthz
+      operationId: health
       responses:
         '200':
           description: Server is up.
@@ -348,60 +400,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Health'
-
-  # --------------------------------------------------------------------------
-  # Legacy single-worker mode
-  # --------------------------------------------------------------------------
-  /configure:
-    post:
-      tags: [legacy]
-      summary: Configure the legacy single worker
-      description: Writes the payload into the `worker-config` ConfigMap.
-      operationId: legacyConfigure
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ConfigureRequest'
-      responses:
-        '200':
-          description: Applied.
-          content:
-            application/json:
-              schema:
-                type: object
-                additionalProperties: true
-        '400':
-          $ref: '#/components/responses/BadRequest'
-  /stop:
-    post:
-      tags: [legacy]
-      summary: Stop the legacy single worker
-      description: Writes an all-zero config into `worker-config`.
-      operationId: legacyStop
-      responses:
-        '200':
-          description: Stopped.
-          content:
-            application/json:
-              schema:
-                type: object
-                additionalProperties: true
-  /status:
-    get:
-      tags: [legacy]
-      summary: Proxy the legacy worker's status
-      operationId: legacyStatus
-      responses:
-        '200':
-          description: Legacy worker state.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/LegacyStatus'
-        '502':
-          $ref: '#/components/responses/UpstreamFailure'
 
 components:
   parameters:
@@ -473,10 +471,12 @@ components:
         b: {type: number}
     PartialFormula:
       type: object
-      description: Partial coefficients for PATCH (deep-merged).
+      description: >-
+        Linear coefficients (target = a * x_role + b). Send only the ones you
+        want to change — the other is left as-is.
       properties:
-        a: {type: number}
-        b: {type: number}
+        a: {type: number, description: Slope (per unit of resolved x), example: 0.3}
+        b: {type: number, description: Constant baseline, example: 1}
 
     RoleSpec:
       type: object
@@ -500,11 +500,23 @@ components:
           description: Per-pod egress target in Mbps.
     PartialRoleSpec:
       type: object
+      description: >-
+        Per-role changes for PATCH. Include only the fields you want to change.
       properties:
-        count: {type: integer, minimum: 1}
-        cpu: {$ref: '#/components/schemas/PartialFormula'}
-        ram: {$ref: '#/components/schemas/PartialFormula'}
-        net: {$ref: '#/components/schemas/PartialFormula'}
+        count:
+          type: integer
+          minimum: 1
+          description: Replica count for this role.
+          example: 3
+        cpu:
+          allOf: [{$ref: '#/components/schemas/PartialFormula'}]
+          description: CPU target coefficients (millicores).
+        ram:
+          allOf: [{$ref: '#/components/schemas/PartialFormula'}]
+          description: RAM target coefficients (MB).
+        net:
+          allOf: [{$ref: '#/components/schemas/PartialFormula'}]
+          description: Per-pod egress target coefficients (Mbps).
 
     Edge:
       type: object
@@ -549,7 +561,7 @@ components:
           items:
             $ref: '#/components/schemas/Edge'
 
-    MaterializeResponse:
+    MaterialiseResponse:
       type: object
       properties:
         name: {type: string}
@@ -767,22 +779,21 @@ components:
           type: object
           description: Present only when by_role=true.
           additionalProperties: {$ref: '#/components/schemas/ResourceBlockAvg'}
+        x:
+          type: object
+          description: Present only when include_x=true. Role name → resolved input x.
+          additionalProperties: {type: number, nullable: true}
+          example: {gateway: 12.0, api: 6.8, db: 6.92}
         prometheus: {$ref: '#/components/schemas/PrometheusHealth'}
 
     ScaleRequest:
       type: object
-      description: Provide exactly one of `replicas` or `delta`.
-      oneOf:
-        - required: [replicas]
-        - required: [delta]
+      required: [replicas]
       properties:
         replicas:
           type: integer
           minimum: 1
           description: Absolute target replica count.
-        delta:
-          type: integer
-          description: Relative change, e.g. 1 or -1.
 
     ScaleResponse:
       type: object
@@ -793,33 +804,6 @@ components:
         previous: {type: integer}
         replicas: {type: integer}
         peers: {$ref: '#/components/schemas/PeerMap'}
-
-    ConfigureRequest:
-      type: object
-      required: [x, cpu, ram, net]
-      properties:
-        x: {type: number}
-        cpu: {$ref: '#/components/schemas/Formula'}
-        ram: {$ref: '#/components/schemas/Formula'}
-        net: {$ref: '#/components/schemas/Formula'}
-
-    LegacyStatus:
-      type: object
-      properties:
-        running: {type: boolean}
-        x: {type: number}
-        cpu_millicores: {type: number}
-        ram_mb: {type: number}
-        net_mbps: {type: number}
-        formulas:
-          type: object
-          properties:
-            cpu: {$ref: '#/components/schemas/Formula'}
-            ram: {$ref: '#/components/schemas/Formula'}
-            net: {$ref: '#/components/schemas/Formula'}
-        peers:
-          type: array
-          items: {type: string}
 
     Health:
       type: object

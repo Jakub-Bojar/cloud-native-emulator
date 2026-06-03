@@ -8,7 +8,7 @@ ASCII (paste-anywhere fallback).
 2. [Template lifecycle](#2-template-lifecycle) — what happens on `POST /templates`
 3. [Worker pod internals](#3-worker-pod-internals) — what's inside a single pod
 4. [x propagation](#4-x-propagation) — how the input signal cascades through roles
-5. [Two-phase materialization](#5-two-phase-materialization) — why deploys take two passes
+5. [Two-phase materialisation](#5-two-phase-materialisation) — why deploys take two passes
 6. [Site API & federation roadmap](#6-site-api--federation-roadmap) — one VM today, a fleet tomorrow
 
 ---
@@ -18,7 +18,7 @@ ASCII (paste-anywhere fallback).
 The big picture. One controller pod plus N×role-count worker pods, all
 in the `cloud-native-emulator` namespace. The controller has two
 ingestion paths (HTTP and labelled-ConfigMap watch) that funnel into a
-single materializer.
+single materialiser.
 
 ### Mermaid
 
@@ -28,7 +28,7 @@ flowchart TB
 
     subgraph cluster["Kubernetes Cluster"]
         subgraph ns["cloud-native-emulator namespace"]
-            Controller["<b>Controller Pod</b><br/>HTTP API · 10s Watcher · Materializer · x Propagator"]
+            Controller["<b>Controller Pod</b><br/>HTTP API · 10s Watcher · Materialiser · x Propagator"]
 
             LCM[("Labelled ConfigMaps<br/>label: emulator.local/template=true")]
 
@@ -81,7 +81,7 @@ flowchart TB
    │                  │  ┌────────────────────┐  │                 │
    │                  │  │ HTTP API (8081)    │  │                 │
    │                  │  │ ConfigMap Watcher  │◀─┼──── 10s poll    │
-   │                  │  │ Materializer       │  │                 │
+   │                  │  │ Materialiser       │  │                 │
    │                  │  │ x-Propagator       │  │                 │
    │                  │  └─────────┬──────────┘  │                 │
    │                  └────────────┼─────────────┘                 │
@@ -123,7 +123,7 @@ flowchart TB
 ## 2. Template lifecycle
 
 The sequence of events when a user calls `POST /templates`. Highlights
-the two-phase materialization that's central to the design.
+the two-phase materialisation that's central to the design.
 
 ### Mermaid
 
@@ -132,7 +132,7 @@ sequenceDiagram
     autonumber
     actor User
     participant Ctrl as Controller
-    participant Mat as Materializer
+    participant Mat as Materialiser
     participant K8s as Kubernetes API
     participant Pod as Worker Pod(s)
 
@@ -141,7 +141,7 @@ sequenceDiagram
     Note over Mat: Schema check<br/>+ cycle detection
     Mat-->>Ctrl: ok (or 400 ValueError)
 
-    Ctrl->>Mat: materialize(template)
+    Ctrl->>Mat: materialise(template)
     Mat->>Mat: _compute_resolved_x()<br/>(Kahn topological sort)
     Note over Mat: Log: resolved x per role
 
@@ -170,7 +170,7 @@ sequenceDiagram
 ### ASCII
 
 ```
-   User              Controller         Materializer        K8s API         Worker Pods
+   User              Controller         Materialiser        K8s API         Worker Pods
     │                    │                   │                 │                 │
     │ POST /templates    │                   │                 │                 │
     ├───────────────────▶│                   │                 │                 │
@@ -179,7 +179,7 @@ sequenceDiagram
     │                    │     schema + cycle detection        │                 │
     │                    │◀──── ok ──────────┤                 │                 │
     │                    │                   │                 │                 │
-    │                    │ materialize()     │                 │                 │
+    │                    │ materialise()     │                 │                 │
     │                    ├──────────────────▶│                 │                 │
     │                    │  ┌────────────────┴──────────┐      │                 │
     │                    │  │ _compute_resolved_x()     │      │                 │
@@ -235,7 +235,7 @@ generators plus a metrics sampler plus a filesystem watcher.
 flowchart TB
     subgraph pod["Worker Pod"]
         subgraph entry["worker.py (entry point)"]
-            HTTP["HTTP Server :8080<br/>/healthz · /status · /metrics"]
+            HTTP["HTTP Server :8080<br/>/health · /status · /metrics"]
             Configure["configure(payload)<br/>━━━━━━━━━━━━━━━<br/>1. stop current<br/>2. start net<br/>3. measure baseline<br/>4. start CPU & RAM"]
         end
 
@@ -333,7 +333,7 @@ flowchart TB
    │                                │                                 │
    │             ┌──────────────────▼──────────────────────┐          │
    │             │ HTTP Server :8080                       │ ◀── scrape
-   │             │  /healthz · /status · /metrics          │   by Prom │
+   │             │  /health · /status · /metrics          │   by Prom │
    │             └─────────────────────────────────────────┘          │
    │                                                                  │
    └──────────────────────────────────────────────────────────────────┘
@@ -432,10 +432,10 @@ flowchart LR
 
 ---
 
-## 5. Two-phase materialization
+## 5. Two-phase materialisation
 
 Why deploys can't happen in a single pass: at create time, pods don't
-have IPs yet. The materializer creates everything first, then resolves
+have IPs yet. The materialiser creates everything first, then resolves
 peers in a second sweep.
 
 ### Mermaid
@@ -617,7 +617,7 @@ For a presentation, you don't need all five at once. Suggested pairings:
 | "How does a template become pods?" | §2 Template lifecycle |
 | "What does a worker actually do?" | §3 Worker internals |
 | "What's clever about the model?" | §4 x propagation |
-| "How are deploys resilient?" | §5 Two-phase materialization |
+| "How are deploys resilient?" | §5 Two-phase materialisation |
 | "How does this scale to many VMs?" | §6 Site API & federation roadmap |
 
 The strongest single-slide story is **§1 + §4 side by side**: §1 shows

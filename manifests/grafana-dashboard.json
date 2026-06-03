@@ -5,8 +5,8 @@
     "name": "worker-emulator",
     "namespace": "default",
     "uid": "821a4f5e-ce99-42c6-bebe-f260fcab6e41",
-    "resourceVersion": "1778846742107015",
-    "generation": 19,
+    "resourceVersion": "1779866993485008",
+    "generation": 21,
     "creationTimestamp": "2026-05-14T08:51:23Z",
     "labels": {
       "grafana.app/deprecatedInternalID": "1029000667705344"
@@ -16,7 +16,7 @@
       "grafana.app/folder": "",
       "grafana.app/saved-from-ui": "Grafana v13.0.1 (a100054f)",
       "grafana.app/updatedBy": "user:afluemnotpkaoa",
-      "grafana.app/updatedTimestamp": "2026-05-15T12:05:42Z"
+      "grafana.app/updatedTimestamp": "2026-05-27T07:29:53Z"
     }
   },
   "spec": {
@@ -67,8 +67,8 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "worker_target_cpu_millicores{pod=~\"$pod\"}",
-                        "legendFormat": "target {{pod}}",
+                        "expr": "max by (role) (worker_target_cpu_millicores{pod=~\"$pod\"})",
+                        "legendFormat": "target {{role}}",
                         "range": true
                       }
                     },
@@ -312,8 +312,8 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "worker_target_ram_mb{pod=~\"$pod\"}",
-                        "legendFormat": "target {{pod}}",
+                        "expr": "max by (role) (worker_target_ram_mb{pod=~\"$pod\"})",
+                        "legendFormat": "target {{role}}",
                         "range": true
                       }
                     },
@@ -557,8 +557,8 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "worker_target_net_mbps{pod=~\"$pod\"}",
-                        "legendFormat": "target {{pod}}",
+                        "expr": "max by (role) (worker_target_net_mbps{pod=~\"$pod\"})",
+                        "legendFormat": "target {{role}}",
                         "range": true
                       }
                     },

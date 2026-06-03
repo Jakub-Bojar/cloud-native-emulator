@@ -17,21 +17,17 @@ MicroK8s host IP) and `localhost:8080` for the worker (after a
 `kubectl port-forward`). Placeholders like `<name>` and `<role>` refer
 to whatever template / role name you're working with.
 
-The controller serves four independent API surfaces:
+The controller serves three independent API surfaces:
 
 - **Templated mode** (`/templates*`) — the primary write API.
-  Materializes whole topologies and resolves x propagation through the
+  Materialises whole topologies and resolves x propagation through the
   role graph. This is what you'll use to create/patch/delete topologies.
 - **Unified site API** (`/api/v1/*`) — the read + scale API. One clean
   JSON surface that fuses Kubernetes state, live worker gauges, and
   Prometheus-backed windowed averages, plus role scaling. Every response
   is tagged with a `site` block for fleet-wide federation. Use this to
   observe and to add/remove pods.
-- **Health** (`/healthz`) — controller liveness.
-- **Legacy single-worker mode** (`/configure`, `/stop`, `/status`) —
-  pre-template API that drives the standalone worker Deployment in
-  `manifests/worker.yaml`. Kept for backwards compatibility; you do
-  not need it if you're using templates.
+- **Health** (`/health`) — controller liveness.
 
 ---
 
@@ -39,12 +35,12 @@ The controller serves four independent API surfaces:
 
 ## `POST /templates`
 
-Materialize a new topology. Validates the template (including cycle
+Materialise a new topology. Validates the template (including cycle
 detection on the role graph), computes the resolved `x` for each role
 via topological propagation, and creates one Deployment + ConfigMap +
 Service per role.
 
-`materialize()` is idempotent: POSTing the same `name` again updates
+`materialise()` is idempotent: POSTing the same `name` again updates
 existing resources via PATCH. You can use this as a "reapply" if you
 ever lose track of state. For surgical updates that only change a few
 fields, prefer `PATCH /templates/<name>` (below).
@@ -116,14 +112,14 @@ curl -X POST http://192.168.2.2:30081/templates \
 
 | Code | Meaning |
 |------|---------|
-| 201 | Materialized |
+| 201 | Materialised |
 | 400 | Invalid JSON, validation failure, or cycle in the role graph |
-| 502 | A k8s API call failed mid-materialization. Partial resources may exist — re-POST or DELETE to clean up |
+| 502 | A k8s API call failed mid-materialisation. Partial resources may exist — re-POST or DELETE to clean up |
 | 500 | Unexpected error |
 
 ## `GET /templates`
 
-List the names of all currently materialized templates.
+List the names of all currently materialised templates.
 
 ```bash
 curl http://192.168.2.2:30081/templates
@@ -132,7 +128,7 @@ curl http://192.168.2.2:30081/templates
 
 ## `GET /templates/<name>`
 
-Inspect a materialized template. The state is reconstructed from
+Inspect a materialised template. The state is reconstructed from
 ConfigMap annotations and live Deployment replica counts — there's no
 in-memory state on the controller.
 
@@ -162,7 +158,7 @@ by the declarative ConfigMap reconciler — see below).
 
 Apply a partial update to a running template. Deep-merges the patch
 body into the existing template, re-runs validation (including cycle
-detection), and re-materializes. Workers pick up the new ConfigMap
+detection), and re-materialises. Workers pick up the new ConfigMap
 within ~60s (kubelet sync) — **no pod restart**.
 
 **Merge semantics:**
@@ -221,14 +217,14 @@ curl -X PATCH http://192.168.2.2:30081/templates/<name> \
 | 200 | Patched |
 | 400 | Invalid JSON, validation failure on the merged result, or cycle |
 | 404 | No template by that name |
-| 502 | k8s API failure during re-materialization |
+| 502 | k8s API failure during re-materialisation |
 | 500 | Unexpected error |
 
 **Caveat for watch-managed templates:** if `source == "watch"`, the
 controller's labelled-ConfigMap watcher (10s poll) will overwrite your
 PATCH with whatever the labelled CM still says. To make a sticky
 change to a watch-managed template, edit the labelled CM instead
-(`kubectl edit configmap <name>`) — the watcher re-materializes from
+(`kubectl edit configmap <name>`) — the watcher re-materialises from
 that.
 
 ## `DELETE /templates/<name>`
@@ -278,7 +274,7 @@ change here.
 
 ## `GET /api/v1/overview`
 
-Site-wide snapshot: every materialized template with per-role desired
+Site-wide snapshot: every materialised template with per-role desired
 vs ready replica counts and a pod-health rollup. The "what is running
 here" endpoint.
 
@@ -379,12 +375,15 @@ pods* and then reduced over the window.
 | `range` | `15m` | Window length. Bare Prometheus duration (`s`/`m`/`h`/`d`); anything else falls back to 15m |
 | `resources` | `cpu,ram,net` | Comma-separated subset to include. Unknown values → 400 |
 | `by_role` | `false` | `true` adds a per-role breakdown (avg only) |
+| `include_x` | `false` | `true` adds an `x` block: each role → its resolved input `x` |
 
 For each resource the totals carry `target_avg`, `actual_avg`,
 `actual_min`, and `actual_max` (the per-role breakdown carries the two
 averages only). Values are summed across all of the template's pods,
 then averaged / min'd / max'd over the window via a Prometheus
-subquery, and rounded to 3 dp.
+subquery, and rounded to 3 dp. The `x` block (when requested) is
+averaged — not summed — across each role's pods, since every pod of a
+role shares the same resolved `x`.
 
 ```bash
 # Whole-template digest over the last hour
@@ -393,6 +392,10 @@ curl -s "http://192.168.2.2:30081/api/v1/templates/<name>/summary?range=1h" \
 
 # Just CPU, broken down by role, over 30 minutes
 curl -s "http://192.168.2.2:30081/api/v1/templates/<name>/summary?range=30m&resources=cpu&by_role=true" \
+  | python3 -m json.tool
+
+# Include the resolved x per role
+curl -s "http://192.168.2.2:30081/api/v1/templates/<name>/summary?range=1h&include_x=true" \
   | python3 -m json.tool
 ```
 
@@ -415,11 +418,13 @@ curl -s "http://192.168.2.2:30081/api/v1/templates/<name>/summary?range=30m&reso
       "net_mbps":       {"target_avg": 9.12,  "actual_avg": 8.7}
     }
   },
+  "x": {"gateway": 12.0, "auth": 6.8, "api": 6.8, "queue": 9.12, "cache": 9.12, "db": 6.92},
   "prometheus": {"available": true, "url": "http://…:9090"}
 }
 ```
 
-`roles` is present only when `by_role=true`.
+`roles` is present only when `by_role=true`; `x` is present only when
+`include_x=true`.
 
 **Graceful degradation:** if Prometheus is unreachable, returns 200 with
 `prometheus.available: false`, `totals: {}` (and `roles: {}` when
@@ -431,29 +436,24 @@ per-role `targets`/`actuals` are the current (instantaneous) sums.
 ## `POST /api/v1/templates/<name>/roles/<role>/scale`
 
 Add or remove pods for one role. Implemented over
-`PATCH /templates/<name>` (`materializer.patch_template`), so scaling
+`PATCH /templates/<name>` (`materialiser.patch_template`), so scaling
 **re-resolves x through the role graph and re-runs peer/port-offset
 assignment** — freshly added pods are fully wired into the topology,
 not just bare Deployment replicas.
 
-**Body — provide exactly one of:**
+**Body:**
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `replicas` | integer | Absolute target count |
-| `delta` | integer | Relative change, e.g. `+1` / `-1` |
+| `replicas` | integer | Required. Absolute target count |
 
 Target must be `>= 1` and `<= MAX_REPLICAS_PER_ROLE` (default 20;
 overridable via env on the controller).
 
 ```bash
-# Absolute: set <role> to 4 pods
+# Set <role> to 4 pods
 curl -X POST http://192.168.2.2:30081/api/v1/templates/<name>/roles/<role>/scale \
   -H 'Content-Type: application/json' -d '{"replicas": 4}'
-
-# Relative: add one pod
-curl -X POST http://192.168.2.2:30081/api/v1/templates/<name>/roles/<role>/scale \
-  -H 'Content-Type: application/json' -d '{"delta": 1}'
 ```
 
 **Response (200):**
@@ -474,14 +474,58 @@ curl -X POST http://192.168.2.2:30081/api/v1/templates/<name>/roles/<role>/scale
 | Code | Meaning |
 |------|---------|
 | 200 | Scaled |
-| 400 | Invalid JSON, unknown role, neither/both of `replicas`/`delta`, non-integer, or out-of-range target |
+| 400 | Invalid JSON, unknown role, missing/non-integer `replicas`, or out-of-range target |
 | 404 | No template by that name |
-| 502 | k8s API failure during re-materialization |
+| 502 | k8s API failure during re-materialisation |
 | 500 | Unexpected error |
 
 > Same watch-managed caveat as `PATCH`: if `source == "watch"`, the
 > ConfigMap watcher will overwrite a scale within ~10s. Edit the
-> labelled ConfigMap's `count` instead for a sticky change.
+> labelled ConfigMap's `count` instead for a sticky change. Check with
+> `curl -s http://192.168.2.2:30081/templates/<name> | jq .source`.
+
+**Verifying a scale took effect:**
+
+```bash
+curl -s http://192.168.2.2:30081/api/v1/templates/<name>/status \
+  | jq '.roles.<role> | {desired, ready, x, pods: (.pods | length)}'
+```
+
+Freshly added pods appear with `"metrics": {}` until they are Ready and
+land in Endpoints (Phase-2 wiring) — an in-progress scale-up is visible
+rather than silently missing.
+
+Scaling a **sender** role re-resolves `x` for everything downstream
+(it's a full re-materialise, not a Deployment replica edit). Watch every
+role's resolved `x` shift after scaling a source:
+
+```bash
+curl -s http://192.168.2.2:30081/api/v1/templates/<name>/status \
+  | jq '.roles | map_values(.x)'
+```
+
+**Validation — these all return `400`** (append `-w '\n%{http_code}\n'`
+to see the status):
+
+```bash
+S=http://192.168.2.2:30081/api/v1/templates/<name>/roles/<role>/scale
+curl -s -X POST $S -H 'Content-Type: application/json' -d '{}'                       # missing replicas
+curl -s -X POST $S -H 'Content-Type: application/json' -d '{"replicas":0}'           # below 1
+curl -s -X POST $S -H 'Content-Type: application/json' -d '{"replicas":21}'          # above MAX_REPLICAS_PER_ROLE
+curl -s -X POST $S -H 'Content-Type: application/json' -d '{"replicas":2.5}'         # non-integer
+curl -s -X POST $S -H 'Content-Type: application/json' -d '{"replicas":true}'        # boolean
+```
+
+**Unknown role (`400`) vs unknown template (`404`):**
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://192.168.2.2:30081/api/v1/templates/<name>/roles/nope/scale \
+  -H 'Content-Type: application/json' -d '{"replicas":2}'      # 400
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://192.168.2.2:30081/api/v1/templates/ghost/roles/<role>/scale \
+  -H 'Content-Type: application/json' -d '{"replicas":2}'      # 404
+```
 
 ---
 
@@ -514,7 +558,7 @@ circularity.
 Cycles in the role graph are rejected at validate time (400 with
 `role graph has a cycle involving: …`).
 
-The resolved x per role is logged at materialize time:
+The resolved x per role is logged at materialise time:
 
 ```
 [controller] Template <name>: resolved x per role = {'<role-a>': 10.0, '<role-b>': 8.0, ...}
@@ -529,7 +573,7 @@ It's also visible per pod in Grafana as the `worker_input_x` gauge.
 The controller also reconciles ConfigMaps labelled with
 `emulator.local/template: "true"`. A polling watcher
 (`controller/watcher.py`, 10s interval) calls into the same
-`materialize()` / `teardown()` codepaths used by `POST` and `DELETE`.
+`materialise()` / `teardown()` codepaths used by `POST` and `DELETE`.
 
 ```yaml
 # <name>-template.yaml
@@ -549,8 +593,8 @@ data:
 ```
 
 ```bash
-microk8s kubectl apply -f <name>-template.yaml   # materializes within ~15s
-microk8s kubectl edit configmap <name>           # live edit → re-materialize
+microk8s kubectl apply -f <name>-template.yaml   # materialises within ~15s
+microk8s kubectl edit configmap <name>           # live edit → re-materialise
 microk8s kubectl delete configmap <name>         # tears the whole topology down
 ```
 
@@ -564,81 +608,14 @@ and the watcher only tears down templates it created.
 
 # Health
 
-## `GET /healthz`
+## `GET /health`
 
 Liveness probe. Always returns 200 as long as the HTTP server is up.
 
 ```bash
-curl http://192.168.2.2:30081/healthz
+curl http://192.168.2.2:30081/health
 # → {"ok":true}
 ```
-
----
-
-# Legacy single-worker mode
-
-> These endpoints predate the templated mode and drive the standalone
-> worker Deployment in `manifests/worker.yaml`. If you're not using
-> that Deployment, you can ignore this entire section.
-
-## `POST /configure`
-
-Validates the payload and writes it into the `worker-config`
-ConfigMap. The standalone worker's watchdog reloads and re-applies.
-
-Required body fields: `x`, `cpu.a`, `cpu.b`, `ram.a`, `ram.b`,
-`net.a`, `net.b`.
-
-```bash
-curl -X POST http://192.168.2.2:30081/configure \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "x": 50,
-    "cpu": {"a": 10,  "b": 100},
-    "ram": {"a": 4,   "b": 64},
-    "net": {"a": 0.1, "b": 1}
-  }'
-```
-
-Status: 200 from the k8s API on successful ConfigMap patch.
-`400` on bad JSON or missing required fields.
-
-## `POST /stop`
-
-Writes an all-zero config into `worker-config`, which the worker
-interprets as "stop".
-
-```bash
-curl -X POST http://192.168.2.2:30081/stop
-```
-
-## `GET /status`
-
-Proxies the legacy single worker's `/status`. Returns the worker's
-current `STATE` dict.
-
-```bash
-curl http://192.168.2.2:30081/status
-```
-
-Response (200):
-```json
-{
-  "running": true,
-  "x": <value>,
-  "cpu_millicores": <value>,
-  "ram_mb": <value>,
-  "net_mbps": <value>,
-  "formulas": { "cpu": {...}, "ram": {...}, "net": {...} },
-  "peers": []
-}
-```
-
-`502` if the worker pod is unreachable.
-
-> **Note:** this endpoint only knows about the legacy worker. In
-> templated mode there are N workers — query each pod's `/status`
-> directly via port-forward (see the Worker section below).
 
 ---
 
@@ -651,10 +628,10 @@ NodePort by default. Reach them with:
 microk8s kubectl port-forward <pod-name> 8080:8080
 ```
 
-## `GET /healthz`
+## `GET /health`
 
 ```bash
-curl http://localhost:8080/healthz
+curl http://localhost:8080/health
 # → {"ok":true}
 ```
 
@@ -717,7 +694,7 @@ curl -s http://localhost:8080/metrics | grep -E "^worker_"
 | POST | `/templates` | Create a topology |
 | GET | `/templates` | List topologies |
 | GET | `/templates/<name>` | Inspect a topology |
-| PATCH | `/templates/<name>` | Partial update — merges, re-resolves, re-materializes |
+| PATCH | `/templates/<name>` | Partial update — merges, re-resolves, re-materialises |
 | DELETE | `/templates/<name>` | Tear a topology down |
 
 ## Unified site API (`/api/v1`)
@@ -726,27 +703,19 @@ curl -s http://localhost:8080/metrics | grep -E "^worker_"
 |--------|------|---------|
 | GET | `/api/v1/overview` | Site-wide snapshot of all templates |
 | GET | `/api/v1/templates/<name>/status` | Rich per-role state + live gauges + edges |
-| GET | `/api/v1/templates/<name>/summary` | CPU/RAM/net averaged over a window (`?range=&resources=&by_role=`) |
-| POST | `/api/v1/templates/<name>/roles/<role>/scale` | Scale a role (`replicas` or `delta`) |
+| GET | `/api/v1/templates/<name>/summary` | CPU/RAM/net averaged over a window (`?range=&resources=&by_role=&include_x=`) |
+| POST | `/api/v1/templates/<name>/roles/<role>/scale` | Scale a role to `replicas` pods |
 
 ## Health
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/healthz` | Controller liveness |
-
-## Legacy single-worker mode
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/configure` | Apply config to the legacy worker |
-| POST | `/stop` | Zero out the legacy worker |
-| GET | `/status` | Proxy the legacy worker's state |
+| GET | `/health` | Controller liveness |
 
 ## Worker (port-forward to access)
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/healthz` | Worker liveness |
+| GET | `/health` | Worker liveness |
 | GET | `/status` | Worker state (resolved x, formulas, peers) |
 | GET | `/metrics` | Prometheus scrape |

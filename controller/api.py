@@ -15,7 +15,7 @@ Read endpoints fuse three data sources:
   - Historical time series via the Prometheus HTTP API (prom.py).
 
 Control endpoints (scaling) are a thin, validated wrapper over
-materializer.patch_template: changing a role's replica count re-resolves x
+materialiser.patch_template: changing a role's replica count re-resolves x
 through the graph and re-runs peer/port-offset assignment so freshly added
 pods are wired into the topology — not just a bare Deployment replica bump.
 
@@ -31,7 +31,7 @@ from urllib.parse import quote
 
 import graph
 import k8s
-import materializer
+import materialiser
 import prom
 
 log = logging.getLogger(__name__)
@@ -82,8 +82,8 @@ def _list_pods(name: str) -> dict[str, dict]:
     Returns {pod_name: {role, phase, ready, restarts, node, ip, age_seconds}}.
     Requires the controller Role to grant pods get/list (see
     manifests/controller.yaml)."""
-    selector = (f"{materializer.MANAGED_BY_LABEL}={materializer.MANAGED_BY_VALUE}"
-                f",{materializer.TEMPLATE_LABEL}={name}")
+    selector = (f"{materialiser.MANAGED_BY_LABEL}={materialiser.MANAGED_BY_VALUE}"
+                f",{materialiser.TEMPLATE_LABEL}={name}")
     path = (f"/api/v1/namespaces/{k8s.namespace()}/pods"
             f"?labelSelector={quote(selector)}")
     status, body = k8s.get(path)
@@ -102,7 +102,7 @@ def _list_pods(name: str) -> dict[str, dict]:
         restarts = sum(int(c.get("restartCount", 0)) for c in cs)
         ready = all(c.get("ready", False) for c in cs) if cs else False
         out[pod] = {
-            "role": (meta.get("labels", {}) or {}).get(materializer.ROLE_LABEL),
+            "role": (meta.get("labels", {}) or {}).get(materialiser.ROLE_LABEL),
             "phase": st.get("phase"),
             "ready": ready,
             "restarts": restarts,
@@ -118,12 +118,12 @@ def _list_pods(name: str) -> dict[str, dict]:
 # ----------------------------------------------------------------------------
 
 def overview() -> dict:
-    """Site-wide snapshot: every materialized template with per-role desired
+    """Site-wide snapshot: every materialised template with per-role desired
     vs ready replica counts and a pod health rollup. The single place to see
     'what is running here'."""
     templates: list[dict] = []
-    for nm in materializer.list_managed():
-        info = materializer.get_managed(nm)
+    for nm in materialiser.list_managed():
+        info = materialiser.get_managed(nm)
         if not info:
             continue
         desired = info.get("replicas", {}) or {}
@@ -278,18 +278,19 @@ def _round(v):
 
 
 def template_summary(name: str, range_str: str = "15m", resources=None,
-                     by_role: bool = False) -> dict | None:
+                     by_role: bool = False, include_x: bool = False) -> dict | None:
     """Compact CPU/RAM/network summary for a template, averaged over a window.
 
     For each requested resource it reports the template-wide target and actual
     *summed across pods*, then reduced over the window: actual gets avg / min /
     max, target gets avg. With by_role=True it also breaks the per-resource
-    averages down by role. None if no such template; graceful degradation if
-    Prometheus is unreachable.
+    averages down by role. With include_x=True an `x` block is added mapping
+    each role to its resolved input x (averaged over the window). None if no
+    such template; graceful degradation if Prometheus is unreachable.
 
     Raises ValueError on an unknown resource → caller maps to 400.
     """
-    info = materializer.get_managed(name)
+    info = materialiser.get_managed(name)
     if info is None:
         return None
 
@@ -308,11 +309,15 @@ def template_summary(name: str, range_str: str = "15m", resources=None,
         "name": name,
         "range": window,
     }
+    roles = (info.get("template") or {}).get("roles") or {}
+
     if not prom.available():
         envelope["prometheus"] = {"available": False, "url": prom.url()}
         envelope["totals"] = {}
         if by_role:
             envelope["roles"] = {}
+        if include_x:
+            envelope["x"] = {}
         return envelope
 
     ns = k8s.namespace()
@@ -339,12 +344,19 @@ def template_summary(name: str, range_str: str = "15m", resources=None,
 
     envelope["totals"] = block(f'namespace="{ns}",pod=~"wt-{name}-.*"', full=True)
     if by_role:
-        roles = (info.get("template") or {}).get("roles") or {}
         envelope["roles"] = {
             role: block(f'namespace="{ns}",pod=~"wt-{name}-{role}-.*"',
                         full=False)
             for role in roles
         }
+    if include_x:
+        # x is the same on every pod of a role, so average (not sum) across the
+        # role's pods to recover that role's resolved input x.
+        def x_of(role: str):
+            scope = f'namespace="{ns}",pod=~"wt-{name}-{role}-.*"'
+            return _round(prom.instant_scalar(
+                f"avg_over_time(avg(worker_input_x{{{scope}}})[{window}:])"))
+        envelope["x"] = {role: x_of(role) for role in roles}
     envelope["prometheus"] = {"available": True, "url": prom.url()}
     return envelope
 
@@ -353,20 +365,19 @@ def template_summary(name: str, range_str: str = "15m", resources=None,
 # Control endpoint: scale a role's replicas
 # ----------------------------------------------------------------------------
 
-def scale_role(name: str, role: str, replicas=None, delta=None) -> dict | None:
-    """Set a role's replica count (add/remove pods).
+def scale_role(name: str, role: str, replicas=None) -> dict | None:
+    """Set a role's replica count to an absolute target (add/remove pods).
 
-    Exactly one of `replicas` (absolute) or `delta` (relative, e.g. +1/-1)
-    must be given. Implemented via materializer.patch_template so that
-    scaling re-resolves x through the role graph and re-runs peer/port-offset
-    assignment — added pods are fully wired into the topology, not just bare
-    replicas. Returns None if no such template.
+    Implemented via materialiser.patch_template so that scaling re-resolves x
+    through the role graph and re-runs peer/port-offset assignment — added
+    pods are fully wired into the topology, not just bare replicas. Returns
+    None if no such template.
 
-    Raises ValueError on bad input (unknown role, missing/both of
-    replicas|delta, out-of-range target) → caller maps to 400.
-    Raises RuntimeError if the k8s re-materialization fails → caller maps 502.
+    Raises ValueError on bad input (unknown role, missing/non-integer
+    replicas, out-of-range target) → caller maps to 400.
+    Raises RuntimeError if the k8s re-materialisation fails → caller maps 502.
     """
-    info = materializer.get_managed(name)
+    info = materialiser.get_managed(name)
     if info is None:
         return None
     template = info.get("template") or {}
@@ -374,19 +385,13 @@ def scale_role(name: str, role: str, replicas=None, delta=None) -> dict | None:
     if role not in roles:
         raise ValueError(f"role {role!r} not in template {name!r}")
 
-    if (replicas is None) == (delta is None):
-        raise ValueError("provide exactly one of 'replicas' or 'delta'")
+    if replicas is None:
+        raise ValueError("'replicas' is required")
+    if not isinstance(replicas, int) or isinstance(replicas, bool):
+        raise ValueError("'replicas' must be an integer")
+    target = replicas
 
     current = int(roles[role].get("count", 1))
-    if replicas is not None:
-        if not isinstance(replicas, int) or isinstance(replicas, bool):
-            raise ValueError("'replicas' must be an integer")
-        target = replicas
-    else:
-        if not isinstance(delta, int) or isinstance(delta, bool):
-            raise ValueError("'delta' must be an integer")
-        target = current + delta
-
     if target < 1:
         raise ValueError("replica count must be >= 1")
     if target > MAX_REPLICAS_PER_ROLE:
@@ -395,7 +400,7 @@ def scale_role(name: str, role: str, replicas=None, delta=None) -> dict | None:
             f"(raise MAX_REPLICAS_PER_ROLE to override)")
 
     log.info("Scaling %s/%s: %d → %d", name, role, current, target)
-    merged = materializer.patch_template(name, {"roles": {role: {"count": target}}})
+    merged = materialiser.patch_template(name, {"roles": {role: {"count": target}}})
     if merged is None:
         return None
     return {
@@ -404,5 +409,5 @@ def scale_role(name: str, role: str, replicas=None, delta=None) -> dict | None:
         "role": role,
         "previous": current,
         "replicas": target,
-        "peers": materializer.compute_peers(merged),
+        "peers": materialiser.compute_peers(merged),
     }

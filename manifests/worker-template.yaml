@@ -20,9 +20,6 @@
 #   ConfigMap/wt-demo-frontend-config   Deployment/wt-demo-frontend   Service/wt-demo-frontend
 #   ConfigMap/wt-demo-backend-config    Deployment/wt-demo-backend    Service/wt-demo-backend
 #
-# The original `worker.yaml` (single-worker, single ConfigMap) is left alone
-# and keeps working alongside this new templated flow.
-#
 # ----------------------------------------------------------------------------
 # Example /templates POST body
 # ----------------------------------------------------------------------------
@@ -121,6 +118,12 @@ spec:
             # fan-out; bump to 8+ for many-to-many.
             - name: IPERF_PORT_COUNT
               value: "2"
+            # stress-ng --cpu-load duty-cycle slice (ms). Small values break
+            # the busy/idle loading into fine slices for much smoother CPU and
+            # better load accuracy when pods share a node (stress-ng's default
+            # cycles in coarse ~0.5s chunks and is bursty). "0" = default.
+            - name: CPU_LOAD_SLICE_MS
+              value: "40"
           ports:
             # HTTP control / status / Prometheus metrics.
             - { name: http,   containerPort: 8080 }
@@ -137,7 +140,7 @@ spec:
               cpu: "2000m"
               memory: "1Gi"
           readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
+            httpGet: { path: /health, port: 8080 }
             periodSeconds: 2
           volumeMounts:
             - name: config

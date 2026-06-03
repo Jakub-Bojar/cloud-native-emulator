@@ -7,12 +7,12 @@ containing a topology (same schema as the HTTP POST body). This module
 polls those labelled ConfigMaps every WATCH_INTERVAL_S seconds and
 keeps the cluster in sync:
 
-  - A labelled CM appears → materialize it.
-  - Its template.json content changes → re-materialize.
+  - A labelled CM appears → materialise it.
+  - Its template.json content changes → re-materialise.
   - The labelled CM is deleted → tear the template down.
 
 The reconciler only touches templates created via this path (the
-materializer stamps each one with `source=watch`). Templates created
+materialiser stamps each one with `source=watch`). Templates created
 via POST /templates are untouched even if no labelled CM names them.
 
 The template name is taken from the labelled ConfigMap's
@@ -32,7 +32,7 @@ import threading
 import time
 
 import k8s
-import materializer
+import materialiser
 
 log = logging.getLogger(__name__)
 
@@ -96,12 +96,12 @@ def _templates_equal(a: dict, b: dict) -> bool:
 def reconcile_once() -> None:
     """One pass: bring the cluster into agreement with labelled CMs."""
     expected = _list_labelled_templates()
-    existing = materializer.list_managed_with_source(materializer.SOURCE_WATCH)
+    existing = materialiser.list_managed_with_source(materialiser.SOURCE_WATCH)
 
     # Create + update.
     for name, template in expected.items():
         try:
-            materializer.validate(template)
+            materialiser.validate(template)
         except ValueError as e:
             log.warning("labelled CM %s: invalid template: %s", name, e)
             continue
@@ -110,16 +110,16 @@ def reconcile_once() -> None:
         action = "update" if name in existing else "create"
         log.info("reconcile %s: %s", name, action)
         try:
-            materializer.materialize(template, source=materializer.SOURCE_WATCH)
+            materialiser.materialise(template, source=materialiser.SOURCE_WATCH)
         except Exception:
-            log.exception("materialize from watch failed for %s", name)
+            log.exception("materialise from watch failed for %s", name)
 
     # Delete: anything we previously created from watch that no longer
     # has a labelled CM.
     for name in existing.keys() - expected.keys():
         log.info("reconcile %s: delete (labelled CM gone)", name)
         try:
-            materializer.teardown(name)
+            materialiser.teardown(name)
         except Exception:
             log.exception("teardown from watch failed for %s", name)
 

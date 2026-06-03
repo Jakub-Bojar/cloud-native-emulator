@@ -8,18 +8,18 @@
 FROM python:3.12-slim
 WORKDIR /app
 
-# PyYAML is used by materializer.py to parse the worker-template blueprint.
+# PyYAML is used by materialiser.py to parse the worker-template blueprint.
 RUN pip install --no-cache-dir pyyaml
 
 COPY controller/controller.py   /app/controller.py
 COPY controller/api.py          /app/api.py
 COPY controller/graph.py        /app/graph.py
 COPY controller/k8s.py          /app/k8s.py
-COPY controller/materializer.py /app/materializer.py
+COPY controller/materialiser.py /app/materialiser.py
 COPY controller/prom.py         /app/prom.py
 COPY controller/watcher.py      /app/watcher.py
 
-# The blueprint stencil. materializer.py reads this at runtime and
+# The blueprint stencil. materialiser.py reads this at runtime and
 # substitutes per-role placeholders before POSTing to the k8s API.
 COPY manifests/worker-template.yaml /etc/emulator/worker-template.yaml
 

@@ -7,17 +7,13 @@ which the kernel automatically counts against the pod's cgroup. start_ram
 allocates an anonymous mmap inside *this* python process and explicitly
 faults every page in.
 
-start_network has two modes:
-
-  - Loopback (peers == []): one iperf3 server + one iperf3 client both
-    on 127.0.0.1:9999. This is the legacy single-worker behaviour.
-  - Peer-to-peer (peers != []): one iperf3 server on 0.0.0.0:9999
-    (accepts inbound connections from other pods), plus one supervisor
-    thread per declared peer. Each supervisor keeps an iperf3 client
-    targeting `<peer>:9999` alive — if the peer isn't Ready yet the
-    iperf3 client exits, the supervisor sleeps briefly and respawns it.
-    The bandwidth target is divided evenly across peers so the pod's
-    total egress matches the configured `net_mbps`.
+start_network runs an iperf3 server pool on consecutive ports from 9999
+(accepts inbound connections from other pods). When the role has outbound
+edges it also starts one supervisor thread per declared peer; each keeps
+an iperf3 client targeting `<peer>:<port>` alive — if the peer isn't Ready
+yet the client exits, the supervisor sleeps briefly and respawns it. The
+bandwidth target is divided evenly across peers so the pod's total egress
+matches the configured `net_mbps`. A role with no peers runs servers only.
 
 PROCS holds child iperf3 / stress-ng processes so stop_current() can
 terminate them. PEER_SUPS holds the per-peer supervisor threads, paired
@@ -36,8 +32,8 @@ import subprocess
 import threading
 import time
 
-from state import (IPERF_BASE_PORT, IPERF_PORT_COUNT, PAGE_SIZE,
-                   STATE, STATE_LOCK,
+from state import (CPU_LOAD_SLICE_MS, IPERF_BASE_PORT, IPERF_PORT_COUNT,
+                   PAGE_SIZE, STATE, STATE_LOCK,
                    PEER_EGRESS_MBPS, PEER_EGRESS_LOCK)
 
 log = logging.getLogger(__name__)
@@ -78,12 +74,19 @@ def start_cpu(millicores: float) -> None:
     workers = max(1, math.ceil(millicores / 1000.0))
     load_per_worker = int(round(millicores / (10.0 * workers)))
     load_per_worker = max(1, min(100, load_per_worker))
-    spawn([
+    cmd = [
         "stress-ng",
         "--cpu", str(workers),
         "--cpu-load", str(load_per_worker),
         "--cpu-method", "matrixprod",
-    ])
+    ]
+    # Break the busy/idle duty cycle into small slices so loading is smooth
+    # rather than cycling in coarse (up to ~0.5s) bursts. Finer slices give the
+    # scheduler frequent yield points → lower variance and better load accuracy
+    # under contention. Only meaningful when --cpu-load < 100.
+    if CPU_LOAD_SLICE_MS > 0 and load_per_worker < 100:
+        cmd += ["--cpu-load-slice", str(CPU_LOAD_SLICE_MS)]
+    spawn(cmd)
 
 
 # A private anonymous mmap pinned by writing one byte per page. Using mmap
@@ -220,26 +223,19 @@ def _peer_client_supervisor(peer: str, mbps_per_peer: float,
 
 
 def start_network(mbps: float, peers: list[str] | None = None,
-                  legacy_loopback: bool = True,
                   server_count: int | None = None,
                   my_port_offset: int = 0) -> None:
     """Bring the network load up to `mbps` Mbps total egress.
 
-    Four operating modes, decided by the caller:
+    Three operating modes, decided by the caller:
 
       - peers non-empty: spawn one supervisor thread per peer; each keeps
         an iperf3 client streaming at `mbps / len(peers)` Mbps to that
         peer. iperf3 server stays running for inbound peer traffic.
 
-      - peers empty, `legacy_loopback=True` (default): legacy single-worker
-        mode. iperf3 server + a loopback iperf3 client at `mbps`. The
-        client stays connected to the local server for the full 24h cap,
-        so the server is effectively single-tenant.
-
-      - peers empty, `legacy_loopback=False`: templated role with no
-        outbound edges. iperf3 server runs but NO client is spawned. The
-        server slot stays free for inbound connections from other roles
-        in the topology. This pod's self-generated net traffic is zero.
+      - peers empty: role with no outbound edges. The iperf3 server pool
+        runs but NO client is spawned, so the server slots stay free for
+        inbound connections from other roles. Self-generated net is zero.
 
       - `mbps == 0` and `server_count > 0`: pure receive-only role. No
         outbound traffic, but iperf3 servers still need to run so that
@@ -280,18 +276,9 @@ def start_network(mbps: float, peers: list[str] | None = None,
 
     peers = peers or []
     if not peers:
-        if not legacy_loopback:
-            # Templated role with no outbound edges. Don't run a loopback
-            # client — server pool stays free for inbound peer traffic.
-            log.info("net: server-only mode (templated role, no peers)")
-            return
-        # Legacy path. iperf3 caps -t at 86400s (24h).
-        spawn([
-            "iperf3", "-c", "127.0.0.1",
-            "-p", str(IPERF_BASE_PORT),
-            "-b", f"{mbps}M",
-            "-t", "86400",
-        ])
+        # Role with no outbound edges. Don't spawn a client — the server
+        # pool stays free for inbound peer traffic.
+        log.info("net: server-only mode (no peers)")
         return
 
     # Peer path: divide bandwidth budget evenly, one supervisor per peer.

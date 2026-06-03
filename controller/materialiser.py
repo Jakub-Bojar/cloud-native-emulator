@@ -1,5 +1,5 @@
 """
-Template materializer.
+Template materialiser.
 
 Takes a parsed template (a dict matching the schema documented in
 manifests/worker-template.yaml) and turns it into a set of Kubernetes
@@ -8,7 +8,7 @@ resources: one ConfigMap + Deployment + Service per role.
 This module is the single source of truth for "what does a template
 become in the cluster". Both ingestion paths added in later steps —
 the HTTP /templates endpoint and the ConfigMap watcher — call into
-materialize() / teardown() here.
+materialise() / teardown() here.
 
 Step 2 only adds this module; nothing imports it yet. Step 3 wires it
 up to the controller's HTTP handler.
@@ -93,7 +93,7 @@ def validate(template: dict) -> None:
     # Cycle detection.  x is resolved per role by a topological pass over
     # the role graph (see _compute_resolved_x); a cycle would make the
     # system underdetermined, so reject it here so the caller gets a clean
-    # 400 instead of a half-materialized template.
+    # 400 instead of a half-materialised template.
     _compute_resolved_x(template)
 
 
@@ -122,7 +122,7 @@ def compute_peers(template: dict) -> dict[str, list[str]]:
 
     This is the *intent* — what the template says — without resolving to
     pod IPs. Used by GET /templates/<name> and as the input to peer
-    resolution at materialize time. The actual peer addresses written
+    resolution at materialise time. The actual peer addresses written
     into worker ConfigMaps are produced by _resolve_peer_ips() below."""
     name = template["name"]
     roles = template["roles"]
@@ -194,7 +194,7 @@ def _resolve_peer_ips(
     A source pod uses a single offset (IPERF_BASE_PORT + offset) on *all* of
     its target pods, so any two source pods that share a target must get
     distinct offsets — otherwise they collide on that target's single-session
-    iperf3 server port. Offsets are assigned by greedy coloring: each source
+    iperf3 server port. Offsets are assigned by greedy colouring: each source
     pod takes the smallest offset not already claimed by another pod it shares
     a target role with. This is correct for arbitrary fan-out/fan-in — a
     source feeding several shared sinks — unlike a per-first-target counter,
@@ -211,7 +211,7 @@ def _resolve_peer_ips(
     effective_server_count : dict[role, int]
         iperf3 server slots each target role needs: (highest offset of any
         pod connecting to it) + 1. May exceed the raw fanin since greedy
-        coloring isn't guaranteed minimal, but it never collides.
+        colouring isn't guaranteed minimal, but it never collides.
     """
     name = template["name"]
     prefix = f"wt-{name}-"
@@ -240,7 +240,7 @@ def _resolve_peer_ips(
                 if ip not in resolved[src_role]:
                     resolved[src_role].append(ip)
 
-    # Greedy coloring. used_by_target[role] is the set of offsets already
+    # Greedy colouring. used_by_target[role] is the set of offsets already
     # claimed by source pods connecting to that target role. A source pod
     # connects to *every* pod of each target role it points at, so all pods
     # of a target role share one offset namespace.
@@ -425,7 +425,7 @@ def _apply(resource: dict) -> None:
 # Public API
 # ----------------------------------------------------------------------------
 
-def materialize(template: dict, source: str = SOURCE_HTTP) -> None:
+def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
     """Create (or update) all Kubernetes resources for the template.
 
     Two phases:
@@ -449,7 +449,7 @@ def materialize(template: dict, source: str = SOURCE_HTTP) -> None:
     """
     validate(template)
     name = template["name"]
-    log.info("Materializing template %s (source=%s)", name, source)
+    log.info("Materialising template %s (source=%s)", name, source)
     blueprint = _load_blueprint()
     template_annotation = json.dumps(template, separators=(",", ":"))
     fanin = _compute_fanin(template)
@@ -540,7 +540,7 @@ def _deep_merge(base: dict, patch: dict) -> dict:
 
 
 def patch_template(name: str, patch: dict) -> dict | None:
-    """Merge `patch` into the existing template `name` and re-materialize.
+    """Merge `patch` into the existing template `name` and re-materialise.
 
     The merge is deep — see `_deep_merge` — so a patch only needs to
     specify the fields that actually change.  The template's `name`
@@ -554,7 +554,7 @@ def patch_template(name: str, patch: dict) -> dict | None:
     Returns the merged template on success, or None if no template
     named `name` exists.  Raises ValueError if the merged template
     fails validation (including cycle detection), and RuntimeError if a
-    Kubernetes API call fails during re-materialization.  materialize()
+    Kubernetes API call fails during re-materialisation.  materialise()
     is idempotent, so a partial failure leaves the cluster in a
     well-defined state that a retry can recover.
     """
@@ -570,7 +570,7 @@ def patch_template(name: str, patch: dict) -> dict | None:
     validate(merged)
     log.info("Patching template %s (source=%s) with: %s", name, source,
              json.dumps(sanitized, separators=(",", ":")))
-    materialize(merged, source=source)
+    materialise(merged, source=source)
     return merged
 
 
@@ -601,7 +601,7 @@ def teardown(name: str) -> int:
 
 
 def list_managed() -> list[str]:
-    """Names of templates currently materialized in the cluster."""
+    """Names of templates currently materialised in the cluster."""
     selector = f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}"
     status, body = k8s.get(_kind_path("ConfigMap", label_selector=selector))
     if status != 200:
@@ -615,12 +615,12 @@ def list_managed() -> list[str]:
 
 
 def get_managed(name: str) -> dict | None:
-    """Reconstruct a materialized template's full state from the cluster.
+    """Reconstruct a materialised template's full state from the cluster.
 
     Returns None if no resources are labelled with the given template
     name. Otherwise returns a dict combining:
       - the original template (read from the annotation we stamped at
-        materialize time),
+        materialise time),
       - the resolved peers per role (recomputed from the template's
         edges so it stays in sync if the annotation lags),
       - the current replica counts as reported by each role's Deployment

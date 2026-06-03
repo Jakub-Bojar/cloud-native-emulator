@@ -5,18 +5,14 @@
 # can hit it from your laptop while developing; switch to ClusterIP/Ingress
 # in production.
 #
-# The controller does two things that require Kubernetes API access:
+# The controller needs Kubernetes API access for the template materialiser
+# (controller/materialiser.py), which creates, updates, and deletes
+# ConfigMaps, Deployments, and Services to stand up the topologies posted to
+# /templates or declared via labelled template ConfigMaps.
 #
-#   1. The legacy /configure flow patches the static `worker-config`
-#      ConfigMap (consumed by manifests/worker.yaml).
-#   2. The template materializer (controller/materializer.py) creates,
-#      updates, and deletes ConfigMaps, Deployments, and Services to
-#      stand up the topologies posted to /templates or declared via
-#      labelled template ConfigMaps.
-#
-# The Role below grants both. It's namespace-scoped (not cluster-wide)
+# The Role below grants that. It's namespace-scoped (not cluster-wide)
 # and intentionally NOT bound to specific resource names — the
-# materializer makes up names at runtime. The materializer label-scopes
+# materialiser makes up names at runtime. The materialiser label-scopes
 # its own deletes via `labelSelector` so it can only ever touch
 # resources it created.
 # ============================================================================
@@ -30,8 +26,8 @@ kind: Role
 metadata:
   name: controller-emulator
 rules:
-  # ConfigMaps: legacy worker-config patches + materialized role configs +
-  # watching labelled template ConfigMaps (Step 6).
+  # ConfigMaps: materialised per-role configs + watching labelled template
+  # ConfigMaps for declarative ingestion.
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -39,7 +35,7 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "create", "update", "patch", "delete"]
-  # Endpoints — read-only. The materializer reads these to enumerate
+  # Endpoints — read-only. The materialiser reads these to enumerate
   # concrete backend pod IPs and write them into source-role ConfigMaps,
   # so iperf3 clients can hit specific pods rather than the Service
   # (avoiding the TCP-stickiness fan-out problem).
@@ -84,10 +80,6 @@ spec:
       ports:
         - containerPort: 8081
       env:
-        - name: WORKER_URL
-          value: "http://worker-service:8080"
-        - name: CONFIGMAP_NAME
-          value: "worker-config"
         # Site identity — this controller's place in the larger cloud system.
         # Every /api/v1 response carries {id, tier} so a future federation
         # gateway can merge data across VMs. Set per VM (edge / fog / cloud).
@@ -95,13 +87,13 @@ spec:
           value: "local"
         - name: SITE_TIER
           value: "unknown"
-        # Prometheus HTTP API base URL for time-series (/api/v1/.../metrics).
+        # Prometheus HTTP API base URL for the windowed /summary endpoint.
         # Depends on your kube-prometheus-stack release/namespace — adjust to
-        # match. If unreachable, metrics endpoints degrade gracefully.
+        # match. If unreachable, /summary degrades gracefully.
         - name: PROM_URL
           value: "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090"
       readinessProbe:
-        httpGet: { path: /healthz, port: 8081 }
+        httpGet: { path: /health, port: 8081 }
         periodSeconds: 2
 ---
 apiVersion: v1

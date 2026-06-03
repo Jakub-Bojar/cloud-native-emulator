@@ -10,11 +10,9 @@ The sampler thread takes a measurement every second:
     `container_memory_working_set_bytes` and is what Grafana plots —
     importantly, it counts shared library pages once per cgroup rather
     than once per process.
-  - Net: bytes_sent delta summed across all interfaces. This is
-    correct in both modes: on loopback every send is also a recv on
-    the same iface, so counting sent-only avoids the double-count;
-    on the pod interface, sent is true egress and recv is from peers
-    (not relevant to "what this pod generated").
+  - Net: bytes_sent delta summed across all interfaces — true egress.
+    recv is inbound traffic from peers and is not counted (it isn't
+    "what this pod generated").
 
 Every 5 s, _adjust_ram() resizes the mmap held by loads.RAM_BUFFER so
 the cgroup working set converges on STATE['ram_mb']. Every 30 s, a
@@ -44,10 +42,10 @@ TARGET_NET = Gauge("worker_target_net_mbps",       "Configured network target (M
 ACTUAL_CPU = Gauge("worker_actual_cpu_millicores", "Measured CPU usage (millicores)")
 ACTUAL_RAM = Gauge("worker_actual_ram_mb",         "Measured RAM usage (MB)")
 ACTUAL_NET = Gauge("worker_actual_net_mbps",
-                   "Measured egress throughput (Mbps). Counts bytes_sent on "
-                   "every interface (loopback counted once). Matches what the "
-                   "net formula targets — pure egress — so actual tracks "
-                   "target correctly for all roles including middle-tier ones.")
+                   "Measured egress throughput (Mbps), bytes_sent across all "
+                   "interfaces. Matches what the net formula targets — pure "
+                   "egress — so actual tracks target for all roles including "
+                   "middle-tier ones.")
 
 INPUT_X = Gauge("worker_input_x", "Current network input value x")
 
@@ -138,19 +136,24 @@ def read_cgroup_working_set_mb() -> float | None:
 
 def _adjust_ram(actual_mb: float) -> None:
     """One step of the RAM feedback loop: compare cgroup working set to
-    STATE['ram_mb'] target and resize the mmap to close the gap."""
+    STATE['ram_mb'] target and resize the mmap to close the gap.
+
+    Crucially this also recovers when RAM_BUFFER is None. If the initial
+    allocation at configure time was skipped — e.g. the baseline was
+    transiently high during startup so `ram_mb - baseline` came out <= 0 —
+    the buffer is None, and the pod would otherwise sit at baseline forever.
+    Treating None as a 0 MB buffer lets the nudger allocate one here once the
+    baseline settles and actual drops below target."""
     with STATE_LOCK:
         target_mb = STATE.get("ram_mb", 0.0)
         running = STATE.get("running", False)
     if not running or target_mb <= 0:
         return
-    buf = loads.RAM_BUFFER
-    if buf is None:
-        return
     error_mb = target_mb - actual_mb
     if abs(error_mb) <= RAM_TOLERANCE_MB:
         return
-    current_mb = len(buf) / (1024 * 1024)
+    buf = loads.RAM_BUFFER
+    current_mb = len(buf) / (1024 * 1024) if buf is not None else 0.0
     new_mb = max(0.0, current_mb + error_mb)
     log.info("RAM nudge: actual=%.1fMB target=%.1fMB → resize mmap %.1f→%.1fMB",
              actual_mb, target_mb, current_mb, new_mb)
@@ -305,7 +308,6 @@ def sampler_loop(interval: float = 1.0) -> None:
             # from upstream roles. Counting recv on top would cause middle-
             # tier pods to always read higher than their target (they send
             # their full budget AND receive from whoever is upstream).
-            # On loopback sent == recv, so counting sent once is still correct.
             #
             # We use a 15s rolling window (oldest-to-newest cumulative byte
             # delta / elapsed time) instead of a 1s delta to suppress the
