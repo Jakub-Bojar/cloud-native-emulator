@@ -28,6 +28,31 @@ IPERF_PORT = IPERF_BASE_PORT
 CPU_LOAD_SLICE_MS = int(os.environ.get("CPU_LOAD_SLICE_MS", "40"))
 PAGE_SIZE = 4096
 RAM_TOLERANCE_MB = 0.5
+
+# --- CPU feedback loop (closed-loop, mirrors the RAM nudger) ---------------
+# CPU used to be open-loop: stress-ng was sized ONCE at configure() time as
+# target - baseline, using a single 1 s baseline sample taken during startup
+# churn. A transiently-high baseline baked in a permanently under-sized
+# stress-ng. These knobs drive a periodic corrector that re-measures the pod's
+# *total* CPU and resizes stress-ng until total converges on the target — so a
+# bad initial guess self-heals, exactly like RAM.
+#
+# CPU_GAIN: fraction of the error closed per correction step. RAM can use 1.0
+#   because its measurement updates instantly; CPU's measured value is a 15 s
+#   rolling average (see metrics.ROLLING_CPU_WINDOW_S), so acting at full gain
+#   against that lag would oscillate. 0.6 converges in ~2-3 steps without
+#   overshoot.
+# CPU_ADJUST_INTERVAL_S: seconds between corrections. MUST be >= the rolling
+#   CPU window (15 s) so each correction reads a measurement that reflects the
+#   previous change rather than stale pre-change samples.
+# CPU_TOLERANCE_*: deadband. We skip a correction when |error| is within
+#   max(CPU_TOLERANCE_MC, CPU_TOLERANCE_FRAC * target). The absolute floor must
+#   be at least one stress-ng quantisation step (~10 mc per worker) so small
+#   targets don't churn the process for sub-step deltas.
+CPU_GAIN = float(os.environ.get("CPU_GAIN", "0.6"))
+CPU_ADJUST_INTERVAL_S = float(os.environ.get("CPU_ADJUST_INTERVAL_S", "15"))
+CPU_TOLERANCE_FRAC = float(os.environ.get("CPU_TOLERANCE_FRAC", "0.05"))
+CPU_TOLERANCE_MC = float(os.environ.get("CPU_TOLERANCE_MC", "15"))
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/etc/emulator/config.json")
 
 # Pod name from the DownwardAPI env injected in the worker template.

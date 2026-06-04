@@ -43,6 +43,11 @@ def configure(payload: dict) -> None:
       3. Measure baseline cgroup memory + CPU.
       4. Start CPU and RAM loads sized to bring pod totals to target.
 
+    Both CPU and RAM are only *seeded* here from the one-shot baseline; the
+    sampler's feedback loops (_adjust_cpu / _adjust_ram) then continuously
+    correct them, so a baseline that reads high during startup churn no longer
+    bakes in a permanently off-target pod.
+
     payload shape:
         { "x": 50,
           "cpu": {"a": 10,  "b": 100},   # millicores
@@ -72,7 +77,9 @@ def configure(payload: dict) -> None:
     ram_mb         = linear(ram_a, ram_b, x)
     net_mbps       = linear(net_a, net_b, x)
 
-    if cpu_millicores == 0 and ram_mb == 0 and net_mbps == 0:
+    server_count = payload.get("server_count") or 0
+
+    if cpu_millicores == 0 and ram_mb == 0 and net_mbps == 0 and not server_count:
         log.info("Configured zero load — staying stopped")
         return
 
@@ -82,7 +89,6 @@ def configure(payload: dict) -> None:
 
     # Network first so iperf3 is part of the baseline that gets subtracted
     # from the CPU and RAM targets.
-    server_count = payload.get("server_count")
     # The controller assigns each source pod a unique port offset so it
     # connects to a distinct iperf3 server port on every target pod.
     # This avoids the iperf3 single-session limit when multiple source
@@ -129,6 +135,10 @@ def configure(payload: dict) -> None:
              f"{cgroup_baseline:.1f}" if cgroup_baseline is not None else "n/a",
              psutil_baseline, baseline_mc)
 
+    # Seed stress-ng with target - baseline. This is only a starting point now:
+    # the CPU feedback loop (_adjust_cpu, every CPU_ADJUST_INTERVAL_S) re-reads
+    # the pod's total CPU and resizes stress-ng until total hits target, so even
+    # if this baseline sample was taken during churn the pod self-corrects.
     loads.start_cpu(max(0.0, cpu_millicores - baseline_mc))
 
     # Rough initial RAM allocation. The sampler nudges this every 5 s to

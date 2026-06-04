@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: target, labels: {app: target}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: target}}
+  template:
+    metadata: {labels: {app: target}}
+    spec:
+      containers:
+        - name: app
+          image: jp36/grayscale-target:latest
+          ports: [{containerPort: 8088}]
+          resources:
+            requests: {cpu: "100m", memory: "64Mi"}
+            limits:   {cpu: "2000m", memory: "1Gi"}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: target}
+spec:
+  type: NodePort
+  selector: {app: target}
+  ports: [{port: 8088, targetPort: 8088, nodePort: 30090}]

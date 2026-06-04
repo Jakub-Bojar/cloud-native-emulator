@@ -124,6 +124,22 @@ spec:
             # cycles in coarse ~0.5s chunks and is bursty). "0" = default.
             - name: CPU_LOAD_SLICE_MS
               value: "40"
+            # CPU feedback loop (closed-loop sizing). stress-ng is seeded at
+            # configure() time then continuously re-sized so the pod's TOTAL
+            # CPU converges on target — this fixes pods that used to stick
+            # below target when their one-shot baseline sample was taken during
+            # startup churn. All three have safe code defaults; they're surfaced
+            # here only so they can be tuned without a rebuild.
+            #   CPU_GAIN               fraction of error closed per step (0.6)
+            #   CPU_ADJUST_INTERVAL_S  seconds between corrections; keep >= the
+            #                          15 s rolling CPU window (15)
+            #   CPU_TOLERANCE_MC       deadband floor in millicores (15)
+            - name: CPU_GAIN
+              value: "0.6"
+            - name: CPU_ADJUST_INTERVAL_S
+              value: "15"
+            - name: CPU_TOLERANCE_MC
+              value: "15"
           ports:
             # HTTP control / status / Prometheus metrics.
             - { name: http,   containerPort: 8080 }

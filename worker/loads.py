@@ -41,6 +41,25 @@ log = logging.getLogger(__name__)
 PROCS: list[subprocess.Popen] = []
 RAM_BUFFER: mmap.mmap | None = None
 
+# The stress-ng process(es) currently generating CPU load. Tracked separately
+# from PROCS (which also holds iperf3 servers) so the CPU feedback loop can
+# terminate ONLY stress-ng — leaving the iperf3 server pool and peer clients
+# untouched — when it resizes the CPU load. Entries here are also in PROCS, so
+# stop_current() still cleans them up on a full reconfigure.
+STRESS_PROCS: list[subprocess.Popen] = []
+
+# Millicores currently requested of stress-ng (the CPU feedback loop's notion
+# of "how much am I generating right now"). 0.0 when no stress-ng is running.
+CPU_STRESS_MC: float = 0.0
+
+# The exact stress-ng argv currently running (None = no stress-ng). Used to
+# skip a kill+respawn when a new target quantises to the identical command —
+# stress-ng can't be resized in place, so an unnecessary respawn would just dip
+# CPU to 0 for a moment and churn the process for no change. A dedicated
+# sentinel distinguishes "never set" from the legitimate None ("no load").
+_CMD_UNSET = object()
+CPU_STRESS_CMD: object = _CMD_UNSET
+
 # Per-peer iperf3 client supervisors. Each entry is (thread, stop_event).
 # The supervisor owns its child iperf3 process; it is NOT added to PROCS
 # (which is reserved for processes whose lifetime is bounded by a single
@@ -63,9 +82,13 @@ def spawn(cmd: list[str]) -> subprocess.Popen:
 # Total CPU% across the pod = N * P. We want total% = millicores / 10.
 # kubectl top reflects this because the kernel accounts busy-loop time to the
 # pod's cgroup. For exact usage, set the pod's CPU *limit* equal to the target.
-def start_cpu(millicores: float) -> None:
+def _cpu_cmd(millicores: float) -> list[str] | None:
+    """Build the stress-ng argv for `millicores`, or None for no load.
+    Pure (no side effects) so the feedback loop can compare the command a new
+    target would produce against the one already running and skip a respawn
+    when they're identical (quantisation makes small deltas collapse)."""
     if millicores <= 0:
-        return
+        return None
     cores = os.cpu_count() or 1
     millicores = min(millicores, cores * 1000.0)
     # Pick the fewest workers that can absorb the requested load at <=100%
@@ -86,7 +109,49 @@ def start_cpu(millicores: float) -> None:
     # under contention. Only meaningful when --cpu-load < 100.
     if CPU_LOAD_SLICE_MS > 0 and load_per_worker < 100:
         cmd += ["--cpu-load-slice", str(CPU_LOAD_SLICE_MS)]
-    spawn(cmd)
+    return cmd
+
+
+def stop_cpu() -> None:
+    """Terminate only the stress-ng process(es), leaving the iperf3 server pool
+    and peer clients running. The CPU feedback loop uses this to resize CPU load
+    without disturbing the network baseline. Resets CPU_STRESS_MC to 0."""
+    global CPU_STRESS_MC
+    for p in STRESS_PROCS:
+        if p.poll() is None:
+            p.send_signal(signal.SIGTERM)
+    for p in STRESS_PROCS:
+        try:
+            p.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        if p in PROCS:
+            PROCS.remove(p)
+    STRESS_PROCS.clear()
+    CPU_STRESS_MC = 0.0
+
+
+def start_cpu(millicores: float) -> bool:
+    """Bring stress-ng to `millicores` of CPU load, replacing any running
+    instance (stress-ng has no live resize). Returns True if it actually
+    (re)started or stopped stress-ng, False if the request quantised to the
+    already-running command and nothing was done — the caller can use this to
+    avoid logging a no-op."""
+    global CPU_STRESS_MC, CPU_STRESS_CMD
+    millicores = max(0.0, millicores)
+    cmd = _cpu_cmd(millicores)
+    if cmd == CPU_STRESS_CMD:
+        # Identical invocation already running (or both "no load"): a respawn
+        # would change nothing but cost a CPU dip. Leave CPU_STRESS_MC at the
+        # value the running command actually represents.
+        return False
+    stop_cpu()
+    CPU_STRESS_CMD = cmd
+    CPU_STRESS_MC = millicores
+    if cmd is None:
+        return True
+    STRESS_PROCS.append(spawn(cmd))
+    return True
 
 
 # A private anonymous mmap pinned by writing one byte per page. Using mmap
@@ -314,7 +379,7 @@ def _stop_peer_supervisors() -> None:
 
 
 def stop_current() -> None:
-    global RAM_BUFFER
+    global RAM_BUFFER, CPU_STRESS_MC, CPU_STRESS_CMD
     _stop_peer_supervisors()
     # Drop stale per-peer egress so a reconfigure with a new peer set doesn't
     # leave dead IPs being republished by the sampler.
@@ -329,6 +394,13 @@ def stop_current() -> None:
         except subprocess.TimeoutExpired:
             p.kill()
     PROCS.clear()
+    # stress-ng children were just killed via PROCS above; clear the parallel
+    # tracker and reset the feedback loop's state so the next configure() seeds
+    # cleanly (CPU_STRESS_CMD back to the sentinel, not a stale command that a
+    # new start_cpu might wrongly treat as "already running" and skip).
+    STRESS_PROCS.clear()
+    CPU_STRESS_MC = 0.0
+    CPU_STRESS_CMD = _CMD_UNSET
     if RAM_BUFFER is not None:
         try:
             RAM_BUFFER.close()

@@ -290,7 +290,7 @@ for pod in $(microk8s kubectl get pods -l template=<name> -o name); do
   PF=$!
   sleep 2
   curl -s http://localhost:${pf_port}/metrics \
-    | grep -E "^worker_(actual|target)_(cpu|ram|net)"
+    | grep -E "^worker_(actual|target)_(cpu|ram|net)|^worker_cpu_stress"
   kill $PF 2>/dev/null
   wait $PF 2>/dev/null
 done
@@ -300,7 +300,12 @@ What "good" looks like after ~60s of settle time:
 - RAM actual within ~1% of target
 - Net actual within ~5% of target on every pod (senders and receivers)
 - CPU `kubectl top` near target; `/metrics` may be bursty but rate over
-  `[1m]` in Grafana converges
+  `[1m]` in Grafana converges. `worker_actual_cpu_millicores` settles within
+  the CPU deadband (`max(CPU_TOLERANCE_MC, 5% of target)`) of target ~30-45s
+  after a (re)configure. Watch `worker_cpu_stress_millicores` step toward its
+  resting value over the first few `CPU_ADJUST_INTERVAL_S` ticks — that's the
+  feedback loop converging. Worker logs print a `CPU nudge: …` line on each
+  resize.
 
 ### Worker startup log
 
@@ -415,9 +420,20 @@ microk8s kubectl delete -f manifests/monitoring.yaml
 ## Known limitations
 
 - **Controller is a `Pod`** — convert to a Deployment for self-healing.
-- **stress-ng CPU is approximate** — `--cpu-load` accuracy depends on
-  scheduler responsiveness, so actual CPU can differ from target and is
-  somewhat bursty. The worker passes `--cpu-load-slice` (env
+- **stress-ng CPU is approximate, but now closed-loop** — `--cpu-load`
+  accuracy depends on scheduler responsiveness, so actual CPU is somewhat
+  bursty. CPU sizing is no longer open-loop: `configure()` only *seeds*
+  stress-ng from the one-shot baseline, then `_adjust_cpu` (every
+  `CPU_ADJUST_INTERVAL_S`, default 15 s) re-reads the pod's total cgroup CPU
+  and resizes stress-ng so total converges on target. A baseline that read
+  high during startup churn — which previously baked in a permanently
+  under-target pod — now self-corrects within a few steps. Residual error
+  settles inside the deadband (`max(CPU_TOLERANCE_MC, CPU_TOLERANCE_FRAC ×
+  target)`); tighten `CPU_TOLERANCE_MC`/`CPU_TOLERANCE_FRAC` for a closer hold
+  or lower `CPU_GAIN` if you see it hunting. One case the loop cannot fix: if
+  the iperf3+python baseline alone exceeds a (low) target, stress-ng goes to 0
+  and the pod still reads above target — fix the formula, not the worker. The
+  worker passes `--cpu-load-slice` (env
   `CPU_LOAD_SLICE_MS`, default 20ms) to break the duty cycle into fine
   slices, which smooths it and tightens accuracy under contention.
   Default is 40ms (a balance of smoothness and mean accuracy); lower it

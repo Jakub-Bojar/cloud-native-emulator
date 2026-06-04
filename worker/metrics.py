@@ -30,7 +30,9 @@ from prometheus_client import Gauge
 
 import loads
 from state import (RAM_TOLERANCE_MB, STATE, STATE_LOCK,
-                   PEER_EGRESS_MBPS, PEER_EGRESS_LOCK)
+                   PEER_EGRESS_MBPS, PEER_EGRESS_LOCK,
+                   CPU_GAIN, CPU_TOLERANCE_FRAC, CPU_TOLERANCE_MC,
+                   CPU_ADJUST_INTERVAL_S)
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +50,13 @@ ACTUAL_NET = Gauge("worker_actual_net_mbps",
                    "middle-tier ones.")
 
 INPUT_X = Gauge("worker_input_x", "Current network input value x")
+
+STRESS_CPU = Gauge("worker_cpu_stress_millicores",
+                   "CPU the feedback loop currently asks stress-ng to generate "
+                   "(millicores). The pod total is this plus the iperf3+python "
+                   "baseline; the loop adjusts this so total converges on "
+                   "worker_target_cpu_millicores. Watch it move after a "
+                   "reconfigure to see the loop working.")
 
 PEER_EGRESS = Gauge("worker_peer_egress_mbps",
                     "Measured egress to a specific peer IP (Mbps), parsed from "
@@ -160,10 +169,57 @@ def _adjust_ram(actual_mb: float) -> None:
     loads.start_ram(new_mb)
 
 
+def _adjust_cpu(actual_total_mc: float) -> None:
+    """One step of the CPU feedback loop: compare the pod's *total* measured
+    CPU to STATE['cpu_millicores'] and resize stress-ng to close the gap.
+
+    Because actual_total_mc already includes the iperf3 + python baseline, the
+    loop sizes stress-ng so total → target without ever measuring the baseline
+    directly — a bad initial guess from configure() self-corrects within a few
+    steps. This is the CPU analogue of _adjust_ram; the differences are forced
+    by CPU not being RAM:
+      - stress-ng can't be resized in place, so a change means kill+respawn
+        (start_cpu handles that, and skips the respawn when the new size
+        quantises to the running command).
+      - actual_total_mc is a 15 s rolling average, so we apply a sub-unity gain
+        and run on an interval >= that window (see state.CPU_*); full-gain
+        correction against a lagged signal would oscillate.
+
+    Caller passes the cgroup-derived average ONLY (never the psutil fallback,
+    which systematically under-reads stress-ng's children — feeding that here
+    would drive a runaway over-correction)."""
+    with STATE_LOCK:
+        target_mc = STATE.get("cpu_millicores", 0.0)
+        running = STATE.get("running", False)
+    if not running or target_mc <= 0:
+        return
+    tol = max(CPU_TOLERANCE_MC, CPU_TOLERANCE_FRAC * target_mc)
+    error_mc = target_mc - actual_total_mc
+    if abs(error_mc) <= tol:
+        return
+    current_stress = loads.CPU_STRESS_MC
+    new_stress = max(0.0, current_stress + CPU_GAIN * error_mc)
+    if new_stress <= 0 and current_stress <= 0:
+        # Over target with stress-ng already at zero: the baseline (iperf3 +
+        # python) alone meets or exceeds the target, so there's nothing left to
+        # give up. Unfixable from the worker — don't churn. (Quiet to avoid
+        # spamming every interval; the gap is visible on the gauges.)
+        return
+    changed = loads.start_cpu(new_stress)
+    if changed:
+        log.info("CPU nudge: actual=%.0fm target=%.0fm err=%+.0fm → "
+                 "stress %.0f→%.0fm", actual_total_mc, target_mc, error_mc,
+                 current_stress, new_stress)
+
+
 def sampler_loop(interval: float = 1.0) -> None:
     self_proc = psutil.Process(os.getpid())
     self_proc.cpu_percent(None)  # prime
     last_ram_adjust = 0.0
+    # Seed the CPU corrector's clock to "now" so the first correction waits a
+    # full interval — by then the rolling CPU average has filled with real data
+    # and reflects configure()'s initial stress-ng size rather than startup 0s.
+    last_cpu_adjust = time.monotonic()
     last_heartbeat = 0.0
     RAM_ADJUST_INTERVAL_S = 5.0
     HEARTBEAT_INTERVAL_S = 30.0
@@ -273,10 +329,20 @@ def sampler_loop(interval: float = 1.0) -> None:
                 ACTUAL_CPU.set(last_cgroup_cpu_mc)
             else:
                 ACTUAL_CPU.set(cpu_pct * 10.0)
+            STRESS_CPU.set(loads.CPU_STRESS_MC)
 
             if now - last_ram_adjust >= RAM_ADJUST_INTERVAL_S:
                 last_ram_adjust = now
                 _adjust_ram(actual_ram_mb)
+
+            # CPU feedback step. Only when cgroup CPU is available — the psutil
+            # fallback under-reads stress-ng and would drive a runaway. The
+            # interval is >= the rolling window so each step reads a settled
+            # measurement of the previous change (see _adjust_cpu).
+            if (last_cgroup_cpu_mc is not None
+                    and now - last_cpu_adjust >= CPU_ADJUST_INTERVAL_S):
+                last_cpu_adjust = now
+                _adjust_cpu(last_cgroup_cpu_mc)
 
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
                 last_heartbeat = now
