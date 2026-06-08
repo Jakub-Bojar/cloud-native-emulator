@@ -84,6 +84,11 @@ def validate(template: dict) -> None:
             sub = role.get(axis)
             if not isinstance(sub, dict) or "a" not in sub or "b" not in sub:
                 raise ValueError(f"role {role_name!r}.{axis} must have 'a' and 'b'")
+        # Optional: pin this role's pods to a tier node (matches the node
+        # label `tier=<value>`, e.g. edge/fog/cloud). Absent = schedule anywhere.
+        tier = role.get("tier")
+        if tier is not None and (not isinstance(tier, str) or not tier):
+            raise ValueError(f"role {role_name!r}.tier must be a non-empty string")
     for edge in template.get("edges", []) or []:
         if edge.get("from") not in roles:
             raise ValueError(f"edge.from {edge.get('from')!r} not in roles")
@@ -107,14 +112,25 @@ def _load_blueprint() -> str:
 
 
 def _render_role(blueprint: str, template_name: str, role_name: str,
-                 count: int, image: str) -> list[dict]:
-    """Substitute placeholders in the blueprint and parse out the docs."""
+                 count: int, image: str, tier: str | None = None) -> list[dict]:
+    """Substitute placeholders in the blueprint and parse out the docs.
+
+    If `tier` is given, pin the role's pods to a matching tier node by
+    injecting `nodeSelector: {tier: <tier>}` into the Deployment's pod spec
+    (done on the parsed dict rather than via string templating so YAML
+    indentation can't break)."""
     rendered = (blueprint
                 .replace("__TEMPLATE__", template_name)
                 .replace("__ROLE__", role_name)
                 .replace("__COUNT__", str(count))
                 .replace("__IMAGE__", image))
-    return [doc for doc in yaml.safe_load_all(rendered) if doc]
+    docs = [doc for doc in yaml.safe_load_all(rendered) if doc]
+    if tier:
+        for doc in docs:
+            if doc.get("kind") == "Deployment":
+                pod_spec = doc["spec"]["template"]["spec"]
+                pod_spec.setdefault("nodeSelector", {})["tier"] = tier
+    return docs
 
 
 def compute_peers(template: dict) -> dict[str, list[str]]:
@@ -466,7 +482,8 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
     # ─── Phase 1: create resources with empty peers ─────────────────────
     for role_name, role in template["roles"].items():
         count = int(role["count"])
-        docs = _render_role(blueprint, name, role_name, count, WORKER_IMAGE)
+        docs = _render_role(blueprint, name, role_name, count, WORKER_IMAGE,
+                            tier=role.get("tier"))
         config_payload = json.dumps(
             _role_config(template, role_name, [],
                          resolved_x=resolved_x[role_name],
@@ -539,11 +556,45 @@ def _deep_merge(base: dict, patch: dict) -> dict:
     return result
 
 
+def _expand_dot_keys(obj):
+    """Expand dot-path keys in a patch into nested dicts, recursively.
+
+    Lets callers write a flat shorthand instead of deeply nested JSON, e.g.
+        {"x": 80, "roles.ingest.cpu.a": 5, "roles.ingest.cpu.b": 100}
+    expands to
+        {"x": 80, "roles": {"ingest": {"cpu": {"a": 5, "b": 100}}}}
+    which then goes through the normal _deep_merge.  Role/field names never
+    contain dots (validate() restricts role names to [a-z0-9-]), so a dot in
+    a key is unambiguously a path separator.  Non-dict values and dot-free
+    keys pass through unchanged, so existing nested patches still work."""
+    if not isinstance(obj, dict):
+        return obj
+    result: dict = {}
+    for key, value in obj.items():
+        value = _expand_dot_keys(value)
+        parts = key.split(".") if isinstance(key, str) else [key]
+        cursor = result
+        for part in parts[:-1]:
+            nxt = cursor.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cursor[part] = nxt
+            cursor = nxt
+        leaf = parts[-1]
+        if isinstance(cursor.get(leaf), dict) and isinstance(value, dict):
+            cursor[leaf] = _deep_merge(cursor[leaf], value)
+        else:
+            cursor[leaf] = value
+    return result
+
+
 def patch_template(name: str, patch: dict) -> dict | None:
     """Merge `patch` into the existing template `name` and re-materialise.
 
     The merge is deep — see `_deep_merge` — so a patch only needs to
-    specify the fields that actually change.  The template's `name`
+    specify the fields that actually change.  Patch keys may also use
+    dot-path shorthand (see `_expand_dot_keys`): `{"roles.ingest.cpu.a": 5}`
+    is equivalent to the fully-nested form.  The template's `name`
     field is always taken from the URL parameter (any `name` in the
     patch body is ignored).  The source annotation (http vs watch) is
     preserved so a watch-managed template stays under watcher control
@@ -563,8 +614,10 @@ def patch_template(name: str, patch: dict) -> dict | None:
         return None
     existing = info["template"]
     source = info.get("source") or SOURCE_HTTP
-    # Strip name from the patch — the URL is the source of truth.
-    sanitized = {k: v for k, v in patch.items() if k != "name"}
+    # Expand dot-path shorthand, then strip name (the URL is the source of
+    # truth), then deep-merge onto the existing template.
+    expanded = _expand_dot_keys(patch)
+    sanitized = {k: v for k, v in expanded.items() if k != "name"}
     merged = _deep_merge(existing, sanitized)
     merged["name"] = name
     validate(merged)

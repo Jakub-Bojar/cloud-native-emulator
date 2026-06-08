@@ -193,7 +193,7 @@ def build_graph(name: str, by_pod: bool = False) -> dict | None:
         return None
     if by_pod:
         return _pod_graph(topo["pod_records"], topo["ip_index"],
-                          topo["color_by_role"])
+                          topo["color_by_role"], topo["roles"])
     return _role_graph(topo["roles"], topo["edges_def"], topo["replicas"],
                        topo["role_pods"], topo["pod_records"],
                        topo["color_by_role"])
@@ -230,16 +230,18 @@ def _role_graph(roles: dict, edges_def: list, replicas: dict,
         x = scrapes[0].get("worker_input_x", 0.0) if scrapes else 0.0
         want = int(replicas.get(role, n_pods))
         frac = _arc(act_cpu, tgt_cpu)
+        tier = (roles.get(role) or {}).get("tier") or "-"
 
         nodes.append({
             "id": role,
             "title": role,
-            "subTitle": f"{n_pods}/{want} pods",
+            "subTitle": f"{tier} · {n_pods}/{want} pods" if tier != "-" else f"{n_pods}/{want} pods",
             "mainStat": f"CPU {act_cpu:.0f}/{tgt_cpu:.0f} m",
             "secondaryStat": f"RAM {act_ram:.0f}/{tgt_ram:.0f} MB",
             "color": color_by_role.get(role, _PALETTE[0]),
             "arc__used": round(frac, 3),
             "arc__free": round(1.0 - frac, 3),
+            "detail__tier": tier,
             "detail__cpu_pct": round(frac * 100, 1),
             "detail__x": round(x, 2),
             "detail__net_in_mbps": round(in_by_role.get(role, 0.0), 2),
@@ -259,7 +261,8 @@ def _role_graph(roles: dict, edges_def: list, replicas: dict,
 
 def _pod_graph(pod_records: list[dict],
                ip_index: dict[str, tuple[str, str]],
-               color_by_role: dict[str, str]) -> dict:
+               color_by_role: dict[str, str],
+               roles: dict | None = None) -> dict:
     # Raw pod→pod edges straight from each pod's peer_egress map.
     edges: list[dict] = []
     in_by_pod: dict[str, float] = {}
@@ -289,19 +292,21 @@ def _pod_graph(pod_records: list[dict],
         tgt_ram = rec.get("worker_target_ram_mb", 0.0)
         x = rec.get("worker_input_x", 0.0)
         frac = _arc(act_cpu, tgt_cpu)
+        tier = ((roles or {}).get(role) or {}).get("tier") or "-"
         # Short, readable title: role + the pod's trailing hash segment.
         suffix = pod.rsplit("-", 1)[-1]
 
         nodes.append({
             "id": pod,
             "title": f"{role}/{suffix}",
-            "subTitle": role,
+            "subTitle": f"{tier} · {role}" if tier != "-" else role,
             "mainStat": f"CPU {act_cpu:.0f}/{tgt_cpu:.0f} m",
             "secondaryStat": f"RAM {act_ram:.0f}/{tgt_ram:.0f} MB",
             "color": color_by_role.get(role, _PALETTE[0]),
             "arc__used": round(frac, 3),
             "arc__free": round(1.0 - frac, 3),
             "detail__role": role,
+            "detail__tier": tier,
             "detail__cpu_pct": round(frac * 100, 1),
             "detail__x": round(x, 2),
             "detail__net_in_mbps": round(in_by_pod.get(pod, 0.0), 2),

@@ -12,7 +12,10 @@ Endpoints
 POST   /templates          materialise a posted template
 GET    /templates          list names of currently materialised templates
 GET    /templates/<name>   inspect a materialised template (peers, replicas)
-PATCH  /templates/<name>   partial update — merge, re-resolve, re-materialise
+PATCH  /templates/<name>   partial update — merge, re-resolve, re-materialise.
+                           Change anything: x, a role's cpu/ram/net/count/tier,
+                           or edges. Accepts nested JSON or dot-path shorthand,
+                           e.g. {"x": 80, "roles.ingest.cpu.a": 6}
 DELETE /templates/<name>   tear down a materialised template
 GET    /graph/<name>       Grafana Node Graph payload (nodes + measured edges);
                            ?view=pods for per-pod nodes (default: per-role)
@@ -23,7 +26,6 @@ Unified site API (see api.py / API.md)
 GET    /api/v1/overview                              site-wide snapshot
 GET    /api/v1/templates/<name>/status               fused k8s + live metrics
 GET    /api/v1/templates/<name>/summary              CPU/RAM/net averaged over a window
-POST   /api/v1/templates/<name>/roles/<role>/scale   scale a role's replicas
 """
 
 import json
@@ -102,7 +104,7 @@ class Handler(BaseHTTPRequestHandler):
             if info is None:
                 self._send_json(404, {"error": f"no template named {name!r}"})
                 return
-            self._send_json(200, info)
+            self._send_json(200, info["template"])
         elif self.path.startswith("/graph/"):
             parsed = urllib.parse.urlparse(self.path)
             name = parsed.path[len("/graph/"):]
@@ -169,42 +171,6 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("api GET %s failed", raw_path)
             self._send_json(502, {"error": str(e)})
 
-    def _handle_api_post(self, raw_path: str, raw_body: bytes) -> None:
-        parsed = urllib.parse.urlparse(raw_path)
-        parts = [p for p in parsed.path.split("/") if p]
-        # /api/v1/templates/<name>/roles/<role>/scale
-        if (len(parts) == 7 and parts[:3] == ["api", "v1", "templates"]
-                and parts[4] == "roles" and parts[6] == "scale"):
-            name, role = parts[3], parts[5]
-            try:
-                body = json.loads(raw_body) if raw_body else {}
-            except json.JSONDecodeError as e:
-                self._send_json(400, {"error": f"invalid JSON: {e}"})
-                return
-            if not isinstance(body, dict):
-                self._send_json(400, {"error": "body must be a JSON object"})
-                return
-            try:
-                result = api.scale_role(name, role,
-                                        replicas=body.get("replicas"))
-            except ValueError as e:
-                self._send_json(400, {"error": str(e)})
-                return
-            except RuntimeError as e:
-                log.exception("scale: k8s API failure")
-                self._send_json(502, {"error": str(e)})
-                return
-            except Exception as e:
-                log.exception("scale raised unexpected error")
-                self._send_json(500, {"error": str(e)})
-                return
-            if result is None:
-                self._send_json(404, {"error": f"no template named {name!r}"})
-                return
-            self._send_json(200, result)
-            return
-        self._send_json(404, {"error": "not found"})
-
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
@@ -238,9 +204,6 @@ class Handler(BaseHTTPRequestHandler):
                 "roles": list(template["roles"].keys()),
                 "peers": materialiser.compute_peers(template),
             })
-
-        elif self.path.startswith("/api/v1/"):
-            self._handle_api_post(self.path, raw)
 
         else:
             self._send(404, b'{"error":"not found"}')

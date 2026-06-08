@@ -14,11 +14,6 @@ Read endpoints fuse three data sources:
     (reusing graph.scrape_topology — no Prometheus dependency).
   - Historical time series via the Prometheus HTTP API (prom.py).
 
-Control endpoints (scaling) are a thin, validated wrapper over
-materialiser.patch_template: changing a role's replica count re-resolves x
-through the graph and re-runs peer/port-offset assignment so freshly added
-pods are wired into the topology — not just a bare Deployment replica bump.
-
 The endpoint routing lives in controller.py; this module holds the logic.
 """
 
@@ -35,10 +30,6 @@ import materialiser
 import prom
 
 log = logging.getLogger(__name__)
-
-# Cap on replicas per role, to stop a typo from trying to schedule thousands
-# of pods. Overridable via env for bigger experiments.
-MAX_REPLICAS_PER_ROLE = int(os.environ.get("MAX_REPLICAS_PER_ROLE", "20"))
 
 # Worker Prometheus gauge name → friendly key used in our JSON responses.
 _GAUGE_MAP = {
@@ -360,54 +351,3 @@ def template_summary(name: str, range_str: str = "15m", resources=None,
     envelope["prometheus"] = {"available": True, "url": prom.url()}
     return envelope
 
-
-# ----------------------------------------------------------------------------
-# Control endpoint: scale a role's replicas
-# ----------------------------------------------------------------------------
-
-def scale_role(name: str, role: str, replicas=None) -> dict | None:
-    """Set a role's replica count to an absolute target (add/remove pods).
-
-    Implemented via materialiser.patch_template so that scaling re-resolves x
-    through the role graph and re-runs peer/port-offset assignment — added
-    pods are fully wired into the topology, not just bare replicas. Returns
-    None if no such template.
-
-    Raises ValueError on bad input (unknown role, missing/non-integer
-    replicas, out-of-range target) → caller maps to 400.
-    Raises RuntimeError if the k8s re-materialisation fails → caller maps 502.
-    """
-    info = materialiser.get_managed(name)
-    if info is None:
-        return None
-    template = info.get("template") or {}
-    roles = template.get("roles") or {}
-    if role not in roles:
-        raise ValueError(f"role {role!r} not in template {name!r}")
-
-    if replicas is None:
-        raise ValueError("'replicas' is required")
-    if not isinstance(replicas, int) or isinstance(replicas, bool):
-        raise ValueError("'replicas' must be an integer")
-    target = replicas
-
-    current = int(roles[role].get("count", 1))
-    if target < 1:
-        raise ValueError("replica count must be >= 1")
-    if target > MAX_REPLICAS_PER_ROLE:
-        raise ValueError(
-            f"replica count {target} exceeds cap {MAX_REPLICAS_PER_ROLE} "
-            f"(raise MAX_REPLICAS_PER_ROLE to override)")
-
-    log.info("Scaling %s/%s: %d → %d", name, role, current, target)
-    merged = materialiser.patch_template(name, {"roles": {role: {"count": target}}})
-    if merged is None:
-        return None
-    return {
-        "site": site_block(),
-        "name": name,
-        "role": role,
-        "previous": current,
-        "replicas": target,
-        "peers": materialiser.compute_peers(merged),
-    }

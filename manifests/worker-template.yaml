@@ -139,7 +139,7 @@ spec:
             - name: CPU_ADJUST_INTERVAL_S
               value: "15"
             - name: CPU_TOLERANCE_MC
-              value: "15"
+              value: "5"
           ports:
             # HTTP control / status / Prometheus metrics.
             - { name: http,   containerPort: 8080 }

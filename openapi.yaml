@@ -59,10 +59,12 @@ servers:
 tags:
   - name: templates
     description: Write API — create, inspect, patch, and delete topologies.
-  - name: site-api
-    description: Unified read + scale API. Responses carry a `site` block.
+  - name: observability
+    description: Unified read API. Responses carry a `site` block.
   - name: health
     description: Liveness.
+  - name: teardown
+    description: Tear down a materialised topology and free its resources.
 
 paths:
   # --------------------------------------------------------------------------
@@ -118,18 +120,19 @@ paths:
       - $ref: '#/components/parameters/TemplateName'
     get:
       tags: [templates]
-      summary: Inspect a template
+      summary: Get a template
       description: |
-        Reconstructed from ConfigMap annotations and live Deployment replica
-        counts — there is no in-memory state on the controller.
+        Returns the template body as stored — the same shape accepted by
+        POST /templates and PATCH /templates/{name}. The response can be
+        used directly as a PATCH body to do a full update.
       operationId: getTemplate
       responses:
         '200':
-          description: Reconstructed template state.
+          description: The template body.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TemplateInspect'
+                $ref: '#/components/schemas/TemplateBody'
         '404':
           $ref: '#/components/responses/NotFound'
     patch:
@@ -141,13 +144,22 @@ paths:
         pod restart. The `name` field in the body is ignored (URL wins).
 
         You can change **any value**: the input `x`, a role's `cpu`/`ram`/`net`
-        coefficients, a role's `count`, or the `edges` list — and you can add
-        a new role. Pick an example below and edit it.
+        coefficients, a role's `count` or `tier`, or the `edges` list — and you
+        can add a new role. Pick an example below and edit it.
 
         Merge rules: **dicts merge recursively** (so `{"roles":{"api":{"cpu":
         {"a":15}}}}` touches only `api.cpu.a`); **scalars and lists replace**
         (to change `edges`, send the whole new array). Deep-merge cannot delete
         a key, so a role can't be removed via PATCH — DELETE + re-POST for that.
+
+        Shorthand: keys may use **dot-paths** — `{"roles.api.cpu.a": 15}` is
+        equivalent to the nested form. This single endpoint handles every kind
+        of change for any template.
+
+        The effect depends on *what* you change, not a separate endpoint:
+        changing only `x`/`cpu`/`ram`/`net` is applied live (ConfigMap rewrite,
+        no pod restart); changing `count` scales the Deployment and `edges`
+        rewires peers (structural).
 
         Caveat: if the template's `source` is `watch`, the labelled-ConfigMap
         watcher will overwrite this patch within ~10s — edit the labelled
@@ -185,7 +197,7 @@ paths:
                 summary: Change a role's network coefficients
                 value: {"roles": {"gateway": {"net": {"a": 0.3, "b": 2}}}}
               scaleRole:
-                summary: Change a role's replica count (same as the scale endpoint)
+                summary: Change a role's replica count
                 value: {"roles": {"cache": {"count": 3}}}
               replaceEdges:
                 summary: Replace the whole edge list (lists replace, not merge)
@@ -224,7 +236,7 @@ paths:
         '500':
           $ref: '#/components/responses/ServerError'
     delete:
-      tags: [templates]
+      tags: [teardown]
       summary: Tear down a template
       description: |
         Deletes every resource labelled with this template name: Deployments
@@ -244,7 +256,7 @@ paths:
   # --------------------------------------------------------------------------
   /api/v1/overview:
     get:
-      tags: [site-api]
+      tags: [observability]
       summary: Site-wide snapshot
       description: |
         Every materialised template with per-role desired/ready replica counts
@@ -262,7 +274,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/TemplateName'
     get:
-      tags: [site-api]
+      tags: [observability]
       summary: Deep live status for one template
       description: |
         Fuses Kubernetes pod state, live `/metrics` scrapes, and measured
@@ -315,7 +327,7 @@ paths:
           type: boolean
           default: false
     get:
-      tags: [site-api]
+      tags: [observability]
       summary: CPU/RAM/network summary averaged over a window
       description: |
         Compact digest of CPU, RAM, and network for a template, averaged over
@@ -339,51 +351,6 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-
-  /api/v1/templates/{name}/roles/{role}/scale:
-    parameters:
-      - $ref: '#/components/parameters/TemplateName'
-      - name: role
-        in: path
-        required: true
-        description: Role within the template.
-        schema:
-          type: string
-    post:
-      tags: [site-api]
-      summary: Scale a role (set the replica count)
-      description: |
-        Set a role's replica count to the absolute target `replicas`.
-        Implemented over `PATCH /templates/{name}`, so scaling re-resolves `x`
-        through the graph and re-runs peer/port-offset assignment — added pods
-        are fully wired into the topology, not bare replicas. Target must be
-        `>= 1` and `<= MAX_REPLICAS_PER_ROLE` (default 20).
-      operationId: scaleRole
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ScaleRequest'
-            examples:
-              setCount:
-                summary: Set the role to 5 pods
-                value: {"replicas": 5}
-      responses:
-        '200':
-          description: Scaled.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ScaleResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '502':
-          $ref: '#/components/responses/UpstreamFailure'
-        '500':
-          $ref: '#/components/responses/ServerError'
 
   # --------------------------------------------------------------------------
   # Health
@@ -498,6 +465,13 @@ components:
           allOf:
             - $ref: '#/components/schemas/Formula'
           description: Per-pod egress target in Mbps.
+        tier:
+          type: string
+          description: >-
+            Optional. Pin this role's pods to nodes labelled `tier=<value>`
+            (e.g. edge / fog / cloud) via a nodeSelector. Omit to schedule
+            anywhere.
+          example: edge
     PartialRoleSpec:
       type: object
       description: >-
@@ -517,6 +491,10 @@ components:
         net:
           allOf: [{$ref: '#/components/schemas/PartialFormula'}]
           description: Per-pod egress target coefficients (Mbps).
+        tier:
+          type: string
+          description: Pin this role's pods to nodes labelled `tier=<value>`.
+          example: cloud
 
     Edge:
       type: object
@@ -549,7 +527,10 @@ components:
 
     TemplatePatch:
       type: object
-      description: Partial template; deep-merged into the live template.
+      description: >-
+        Partial template; deep-merged into the live template. Keys may use
+        dot-path shorthand — `{"roles.api.cpu.a": 15}` equals the nested form.
+        Roles may also carry a `tier`.
       properties:
         x: {type: number}
         roles:
@@ -575,24 +556,6 @@ components:
       type: object
       properties:
         templates:
-          type: array
-          items: {type: string}
-
-    TemplateInspect:
-      type: object
-      properties:
-        name: {type: string}
-        source:
-          type: string
-          enum: [http, watch]
-        template:
-          $ref: '#/components/schemas/TemplateBody'
-        peers:
-          $ref: '#/components/schemas/PeerMap'
-        replicas:
-          type: object
-          additionalProperties: {type: integer}
-        configmaps:
           type: array
           items: {type: string}
 
@@ -785,25 +748,6 @@ components:
           additionalProperties: {type: number, nullable: true}
           example: {gateway: 12.0, api: 6.8, db: 6.92}
         prometheus: {$ref: '#/components/schemas/PrometheusHealth'}
-
-    ScaleRequest:
-      type: object
-      required: [replicas]
-      properties:
-        replicas:
-          type: integer
-          minimum: 1
-          description: Absolute target replica count.
-
-    ScaleResponse:
-      type: object
-      properties:
-        site: {$ref: '#/components/schemas/Site'}
-        name: {type: string}
-        role: {type: string}
-        previous: {type: integer}
-        replicas: {type: integer}
-        peers: {$ref: '#/components/schemas/PeerMap'}
 
     Health:
       type: object
