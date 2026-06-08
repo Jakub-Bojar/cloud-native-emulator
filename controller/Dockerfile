@@ -8,10 +8,12 @@
 FROM python:3.12-slim
 WORKDIR /app
 
-# PyYAML is used by materialiser.py to parse the worker-template blueprint.
-RUN pip install --no-cache-dir pyyaml
+# FastAPI + uvicorn serve the HTTP API; PyYAML is used by materialiser.py to
+# parse the worker-template blueprint.
+COPY controller/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY controller/controller.py   /app/controller.py
+COPY controller/app.py          /app/app.py
 COPY controller/api.py          /app/api.py
 COPY controller/graph.py        /app/graph.py
 COPY controller/k8s.py          /app/k8s.py
@@ -24,7 +26,11 @@ COPY controller/watcher.py      /app/watcher.py
 COPY manifests/worker-template.yaml /etc/emulator/worker-template.yaml
 
 EXPOSE 8081
-ENV CONTROLLER_PORT=8081
 ENV BLUEPRINT_PATH=/etc/emulator/worker-template.yaml
 
-CMD ["python", "-u", "controller.py"]
+# One worker process: the watcher reconciler runs in-process as a daemon
+# thread (see app.py lifespan), so multiple processes would each run their own
+# reconciler. Concurrency for blocking handlers comes from uvicorn's threadpool
+# for sync `def` endpoints, which is what keeps /health responsive during a
+# long materialise. --port honours CONTROLLER_PORT if set, else 8081.
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${CONTROLLER_PORT:-8081}"]

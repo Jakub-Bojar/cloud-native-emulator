@@ -117,7 +117,7 @@ cloud-native-emulator/
 ├── ARCHITECTURE.md · API.md · RUNBOOK.md · openapi.yaml
 ├── controller/
 │   ├── Dockerfile
-│   ├── controller.py     HTTP routes: /templates CRUD + /graph + /api/v1
+│   ├── app.py            FastAPI HTTP routes: /templates CRUD + /graph + /api/v1
 │   ├── api.py            unified /api/v1 site API (query + scale)
 │   ├── prom.py           Prometheus HTTP API client
 │   ├── graph.py          topology scrape + edge measurement

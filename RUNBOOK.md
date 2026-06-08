@@ -458,7 +458,7 @@ microk8s kubectl delete -f manifests/monitoring.yaml
 
 ```
 controller/
-  controller.py     HTTP routes: /templates CRUD + /graph + /api/v1
+  app.py            FastAPI HTTP routes: /templates CRUD + /graph + /api/v1
   api.py            unified /api/v1 site API: query (k8s+scrape+prom) + scale
   prom.py           Prometheus HTTP API client (instant queries), graceful
   graph.py          topology scrape + edge measurement (shared by /graph + api)

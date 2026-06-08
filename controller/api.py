@@ -14,7 +14,7 @@ Read endpoints fuse three data sources:
     (reusing graph.scrape_topology — no Prometheus dependency).
   - Historical time series via the Prometheus HTTP API (prom.py).
 
-The endpoint routing lives in controller.py; this module holds the logic.
+The endpoint routing lives in app.py; this module holds the logic.
 """
 
 import json
