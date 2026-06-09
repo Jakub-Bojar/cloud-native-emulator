@@ -30,11 +30,11 @@ rules:
   # ConfigMaps for declarative ingestion.
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
   # Services fronting each role.
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["get", "list", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "create", "update", "patch", "delete", "deletecollection"]
   # Endpoints — read-only. The materialiser reads these to enumerate
   # concrete backend pod IPs and write them into source-role ConfigMaps,
   # so iperf3 clients can hit specific pods rather than the Service
@@ -51,7 +51,7 @@ rules:
   # The Deployment per role.
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["get", "list", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "create", "update", "patch", "delete", "deletecollection"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -82,11 +82,18 @@ spec:
         app: controller
     spec:
       serviceAccountName: controller-sa
-      # Always run on the cloud node (where the control plane lives). This
-      # also means the controller self-heals onto cloud after any node bounce
-      # instead of vanishing like the old bare Pod did.
+      # Run on the control-plane node (microk8s-vm). It carries the
+      # `dedicated=control-plane` taint to keep tier workloads off, so the
+      # controller needs a matching toleration plus a hostname nodeSelector
+      # to pin it there. Keeping the controller beside the API server keeps
+      # the emulated tiers (cloud/fog/edge) free of control logic.
       nodeSelector:
-        tier: cloud
+        kubernetes.io/hostname: microk8s-vm
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: control-plane
+          effect: NoSchedule
       containers:
         - name: controller
           image: jp36/emulator-controller:latest
