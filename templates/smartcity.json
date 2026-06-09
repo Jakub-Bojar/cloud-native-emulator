@@ -1,0 +1,64 @@
+{
+  "name": "smartcity",
+  "x": 40,
+  "roles": {
+    "sensor": {
+      "count": 3,
+      "tier": "edge",
+      "cpu": {"a": 0.3, "b": 30},
+      "ram": {"a": 0, "b": 32},
+      "net": {"a": 0.1, "b": 6}
+    },
+    "camera": {
+      "count": 1,
+      "tier": "edge",
+      "cpu": {"a": 1.0, "b": 60},
+      "ram": {"a": 0, "b": 96},
+      "net": {"a": 0.4, "b": 15}
+    },
+    "gateway": {
+      "count": 2,
+      "tier": "fog",
+      "cpu": {"a": 2, "b": 50},
+      "ram": {"a": 0, "b": 128},
+      "net": {"a": 0.5, "b": 5}
+    },
+    "cache": {
+      "count": 1,
+      "tier": "fog",
+      "cpu": {"a": 0, "b": 40},
+      "ram": {"a": 0.5, "b": 256},
+      "net": {"a": 0, "b": 0}
+    },
+    "ingest": {
+      "count": 2,
+      "tier": "cloud",
+      "cpu": {"a": 4, "b": 80},
+      "ram": {"a": 0, "b": 256},
+      "net": {"a": 0.2, "b": 4}
+    },
+    "analytics": {
+      "count": 1,
+      "tier": "cloud",
+      "cpu": {"a": 8, "b": 120},
+      "ram": {"a": 1, "b": 256},
+      "net": {"a": 0, "b": 2}
+    },
+    "db": {
+      "count": 1,
+      "tier": "cloud",
+      "cpu": {"a": 0, "b": 80},
+      "ram": {"a": 0, "b": 512},
+      "net": {"a": 0, "b": 0}
+    }
+  },
+  "edges": [
+    {"from": "sensor",    "to": "gateway"},
+    {"from": "camera",    "to": "gateway"},
+    {"from": "gateway",   "to": "cache"},
+    {"from": "gateway",   "to": "ingest"},
+    {"from": "ingest",    "to": "analytics"},
+    {"from": "ingest",    "to": "db"},
+    {"from": "analytics", "to": "db"}
+  ]
+}

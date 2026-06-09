@@ -1,0 +1,39 @@
+{
+  "name": "iot-pipeline",
+  "x": 50,
+  "roles": {
+    "sensor": {
+      "count": 3,
+      "tier": "edge",
+      "cpu": {"a": 0.2, "b": 50},
+      "ram": {"a": 0.1, "b": 43},
+      "net": {"a": 0.15, "b": 3}
+    },
+    "gateway": {
+      "count": 1,
+      "tier": "fog",
+      "cpu": {"a": 2, "b": 50},
+      "ram": {"a": 0.5, "b": 110},
+      "net": {"a": 0.5, "b": 5}
+    },
+    "ingest": {
+      "count": 1,
+      "tier": "cloud",
+      "cpu": {"a": 5, "b": 100},
+      "ram": {"a": 1, "b": 235},
+      "net": {"a": 0.2, "b": 3}
+    },
+    "db": {
+      "count": 1,
+      "tier": "cloud",
+      "cpu": {"a": 1, "b": 70},
+      "ram": {"a": 0, "b": 512},
+      "net": {"a": 0, "b": 0}
+    }
+  },
+  "edges": [
+    {"from": "sensor", "to": "gateway"},
+    {"from": "gateway", "to": "ingest"},
+    {"from": "ingest", "to": "db"}
+  ]
+}
