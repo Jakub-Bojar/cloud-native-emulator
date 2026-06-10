@@ -21,10 +21,8 @@ import json
 import logging
 import os
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import psutil
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 import loads
@@ -39,14 +37,13 @@ def configure(payload: dict) -> None:
     """
     Apply a new configuration:
       1. Stop whatever was running.
-      2. Bring up the network load (it has a non-trivial baseline footprint).
-      3. Measure baseline cgroup memory + CPU.
-      4. Start CPU and RAM loads sized to bring pod totals to target.
+      2. Bring up the network load.
+      3. Seed the CPU load at the raw target; RAM starts unallocated.
 
-    Both CPU and RAM are only *seeded* here from the one-shot baseline; the
-    sampler's feedback loops (_adjust_cpu / _adjust_ram) then continuously
-    correct them, so a baseline that reads high during startup churn no longer
-    bakes in a permanently off-target pod.
+    No baseline is measured here: the sampler's feedback loops
+    (_adjust_cpu / _adjust_ram) measure the pod's real totals and resize
+    stress-ng / the mmap until they converge on target, so the seed error
+    (the iperf3 + python footprint) is corrected within a few cycles.
 
     payload shape:
         { "x": 50,
@@ -87,8 +84,6 @@ def configure(payload: dict) -> None:
     log.info("Configuring x=%.2f → CPU=%.0fm, RAM=%.1fMB, NET=%.2fMbps %s",
              x, cpu_millicores, ram_mb, net_mbps, mode_str)
 
-    # Network first so iperf3 is part of the baseline that gets subtracted
-    # from the CPU and RAM targets.
     # The controller assigns each source pod a unique port offset so it
     # connects to a distinct iperf3 server port on every target pod.
     # This avoids the iperf3 single-session limit when multiple source
@@ -100,50 +95,16 @@ def configure(payload: dict) -> None:
     loads.start_network(net_mbps, peers,
                         server_count=server_count,
                         my_port_offset=my_port_offset)
-    # Give the network a moment before sampling the baseline. The peer
-    # supervisor threads have just spawned their iperf3 clients but the peer
-    # pods may still be coming up — we sleep 1 s so the baseline window
-    # includes whatever traffic we can generate immediately; CPU subtraction
-    # stays correct as more peers come online (the sampler keeps the gauge live).
-    time.sleep(1.0)
 
-    # Sample CPU over a 1 s window to get a meaningful baseline_mc.
-    self_proc = psutil.Process(os.getpid())
-    self_proc.cpu_percent(None)
-    for c in self_proc.children(recursive=True):
-        try:
-            c.cpu_percent(None)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    time.sleep(1.0)
+    # Seed stress-ng at the full CPU target. The pod total briefly overshoots
+    # by the iperf3 + python footprint; the CPU feedback loop (_adjust_cpu)
+    # re-reads the pod's total CPU every CPU_ADJUST_INTERVAL_S and resizes
+    # stress-ng until the total converges on target.
+    loads.start_cpu(cpu_millicores)
 
-    baseline_cpu_pct = self_proc.cpu_percent(None)
-    for c in self_proc.children(recursive=True):
-        try:
-            baseline_cpu_pct += c.cpu_percent(None)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-
-    # cgroup working set matches what Grafana plots; psutil sum is just
-    # logged for comparison (it double-counts shared library pages).
-    cgroup_baseline = metrics.read_cgroup_working_set_mb()
-    psutil_baseline = metrics.sum_rss_mb(self_proc)
-    baseline_rss_mb = cgroup_baseline if cgroup_baseline is not None else psutil_baseline
-    baseline_mc = baseline_cpu_pct * 10.0
-    log.info("Baseline (net+python): RAM=%.1fMB (cgroup=%s psutil=%.1f) CPU=%.0fm",
-             baseline_rss_mb,
-             f"{cgroup_baseline:.1f}" if cgroup_baseline is not None else "n/a",
-             psutil_baseline, baseline_mc)
-
-    # Seed stress-ng with target - baseline. This is only a starting point now:
-    # the CPU feedback loop (_adjust_cpu, every CPU_ADJUST_INTERVAL_S) re-reads
-    # the pod's total CPU and resizes stress-ng until total hits target, so even
-    # if this baseline sample was taken during churn the pod self-corrects.
-    loads.start_cpu(max(0.0, cpu_millicores - baseline_mc))
-
-    # Rough initial RAM allocation. The sampler nudges this every 5 s to
-    # close the remaining gap.
-    loads.start_ram(max(0.0, ram_mb - baseline_rss_mb))
+    # RAM starts unallocated: the nudger (_adjust_ram) sizes the mmap against
+    # the live cgroup working set within one 5 s cycle. Seeding from below
+    # also keeps a target near the pod's memory limit from overshooting.
 
     with STATE_LOCK:
         STATE.update({

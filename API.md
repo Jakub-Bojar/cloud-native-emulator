@@ -239,8 +239,9 @@ curl -X DELETE http://192.168.2.2:30081/templates/<name>
 ```
 
 `deleted` is the number of Kubernetes objects removed (rough count).
-Returns 200 even if some kinds were already absent (404 from k8s is
-treated as already-gone).
+Returns 404 if no template with that name is materialised; during the
+teardown itself, a kind that is already absent is treated as
+already-gone rather than an error.
 
 ---
 

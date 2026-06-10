@@ -241,7 +241,7 @@ paths:
       description: |
         Deletes every resource labelled with this template name: Deployments
         first (so pods stop using the ConfigMap), then Services, then
-        ConfigMaps. Returns 200 even if some kinds were already absent.
+        ConfigMaps. 404 if no such template is materialised.
       operationId: deleteTemplate
       responses:
         '200':
@@ -250,6 +250,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeleteResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   # --------------------------------------------------------------------------
   # Unified site API

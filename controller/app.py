@@ -210,8 +210,13 @@ def patch_template(name: str, patch: dict):
 
 @app.delete("/templates/{name}")
 def delete_template(name: str):
-    log.info("Tearing down template %s", name)
     with _template_lock(name):
+        # 404 on an unknown name so "deleted nothing because it was already
+        # gone" is distinguishable from a real teardown; the check shares the
+        # lock so a concurrent DELETE can't slip between check and teardown.
+        if materialiser.get_managed(name) is None:
+            raise HTTPException(404, f"no template named {name!r}")
+        log.info("Tearing down template %s", name)
         deleted = materialiser.teardown(name)
     return {"name": name, "deleted": deleted}
 

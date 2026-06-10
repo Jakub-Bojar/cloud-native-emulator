@@ -1,12 +1,13 @@
 """
 Measurement + Prometheus gauges + RAM feedback control.
 
-The sampler thread takes a measurement every second:
-  - CPU: psutil per-process sum (the kernel attributes busy-loop time
-    cleanly to children of this process, so psutil's view here is
-    accurate).
-  - RAM: read directly from the pod's cgroup `memory.current` minus
-    `inactive_file`. This is what cAdvisor exports as
+The sampler thread takes a measurement every second, all from cgroup
+files — the same sources cAdvisor and kubectl top read:
+  - CPU: the cgroup's cumulative usage (cpu.stat usage_usec) averaged
+    over a 15 s rolling window. A per-process psutil sum would miss
+    stress-ng's ephemeral worker children and under-read.
+  - RAM: the cgroup working set (`memory.current` minus `inactive_file`).
+    This is what cAdvisor exports as
     `container_memory_working_set_bytes` and is what Grafana plots —
     importantly, it counts shared library pages once per cgroup rather
     than once per process.
@@ -63,18 +64,6 @@ PEER_EGRESS = Gauge("worker_peer_egress_mbps",
                     "the iperf3 client's per-second interval reports. One "
                     "series per peer IP this pod is sending to.",
                     ["peer"])
-
-
-def sum_rss_mb(proc: psutil.Process) -> float:
-    """Sum process + descendant RSS. Diagnostic only — for the gauge/nudger
-    we use the cgroup working set because psutil double-counts shared pages."""
-    rss = proc.memory_info().rss
-    for c in proc.children(recursive=True):
-        try:
-            rss += c.memory_info().rss
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return rss / (1024 * 1024)
 
 
 _CGROUP_PATHS: tuple[str, str, str] | None = None
@@ -147,12 +136,11 @@ def _adjust_ram(actual_mb: float) -> None:
     """One step of the RAM feedback loop: compare cgroup working set to
     STATE['ram_mb'] target and resize the mmap to close the gap.
 
-    Crucially this also recovers when RAM_BUFFER is None. If the initial
-    allocation at configure time was skipped — e.g. the baseline was
-    transiently high during startup so `ram_mb - baseline` came out <= 0 —
-    the buffer is None, and the pod would otherwise sit at baseline forever.
-    Treating None as a 0 MB buffer lets the nudger allocate one here once the
-    baseline settles and actual drops below target."""
+    configure() never allocates the buffer — RAM_BUFFER is None after every
+    reconfigure. Treating None as a 0 MB buffer means this loop also performs
+    the initial allocation, sized against the live cgroup working set, so the
+    python + iperf3 footprint is accounted for without being measured
+    explicitly."""
     with STATE_LOCK:
         target_mb = STATE.get("ram_mb", 0.0)
         running = STATE.get("running", False)
@@ -183,11 +171,7 @@ def _adjust_cpu(actual_total_mc: float) -> None:
         quantises to the running command).
       - actual_total_mc is a 15 s rolling average, so we apply a sub-unity gain
         and run on an interval >= that window (see state.CPU_*); full-gain
-        correction against a lagged signal would oscillate.
-
-    Caller passes the cgroup-derived average ONLY (never the psutil fallback,
-    which systematically under-reads stress-ng's children — feeding that here
-    would drive a runaway over-correction)."""
+        correction against a lagged signal would oscillate."""
     with STATE_LOCK:
         target_mc = STATE.get("cpu_millicores", 0.0)
         running = STATE.get("running", False)
@@ -213,8 +197,6 @@ def _adjust_cpu(actual_total_mc: float) -> None:
 
 
 def sampler_loop(interval: float = 1.0) -> None:
-    self_proc = psutil.Process(os.getpid())
-    self_proc.cpu_percent(None)  # prime
     last_ram_adjust = 0.0
     # Seed the CPU corrector's clock to "now" so the first correction waits a
     # full interval — by then the rolling CPU average has filled with real data
@@ -228,11 +210,6 @@ def sampler_loop(interval: float = 1.0) -> None:
     # can remove series for peers that vanish after a reconfigure.
     published_peers: set[str] = set()
 
-    # cpu_percent(None) returns CPU since the *previous* call on the same
-    # Process object — the first call always returns 0.0. Cache children
-    # across iterations so each one accumulates real samples.
-    child_cache: dict[int, psutil.Process] = {}
-
     # Cgroup CPU is averaged over a rolling 15s window so the gauge
     # matches what kubectl top (and the Grafana dashboard's rate()[1m])
     # show, instead of bouncing with stress-ng's sub-second bursts.
@@ -242,7 +219,6 @@ def sampler_loop(interval: float = 1.0) -> None:
     cur0 = read_cgroup_cpu_usec()
     if cur0 is not None:
         cgroup_cpu_samples.append((time.monotonic(), cur0))
-    last_per_proc_breakdown: list[tuple[int, str, float]] = []
     last_cgroup_cpu_mc: float | None = None
 
     # Network egress is also averaged over a 15s rolling window.
@@ -263,51 +239,21 @@ def sampler_loop(interval: float = 1.0) -> None:
         # thread — the pod would stay Ready but ACTUAL_RAM would freeze
         # and the RAM nudger would stop firing. Catch and continue.
         try:
-            live_pids = set()
-            cpu_pct = self_proc.cpu_percent(None)
-            rss_bytes = self_proc.memory_info().rss
-            per_proc: list[tuple[int, str, float]] = [
-                (self_proc.pid, "python", cpu_pct),
-            ]
-            for child in self_proc.children(recursive=True):
-                live_pids.add(child.pid)
-                proc = child_cache.get(child.pid)
-                if proc is None:
-                    child_cache[child.pid] = child
-                    try:
-                        child.cpu_percent(None)  # prime; first reading is 0
-                        rss_bytes += child.memory_info().rss
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
-                    continue
-                try:
-                    c_pct = proc.cpu_percent(None)
-                    cpu_pct += c_pct
-                    rss_bytes += proc.memory_info().rss
-                    try:
-                        per_proc.append((proc.pid, proc.name()[:16], c_pct))
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        per_proc.append((proc.pid, "?", c_pct))
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            for pid in list(child_cache.keys()):
-                if pid not in live_pids:
-                    del child_cache[pid]
-
-            psutil_rss_mb = rss_bytes / (1024 * 1024)
-            cgroup_mb = read_cgroup_working_set_mb()
-            actual_ram_mb = cgroup_mb if cgroup_mb is not None else psutil_rss_mb
-            ACTUAL_RAM.set(actual_ram_mb)
-
             now = time.monotonic()
 
-            # Cgroup CPU is the truth — same source cAdvisor and kubectl top
-            # use. We previously set ACTUAL_CPU from a psutil sum across child
-            # processes, but that approach systematically misses stress-ng's
-            # ephemeral worker children. Here we keep a 15s sliding window of
-            # cumulative usage_usec readings and compute the gauge as
-            # (newest - oldest) / wall-clock — i.e. a rolling 15s average,
-            # which smooths over stress-ng's bursty load cycles.
+            # RAM: the cgroup working set — what cAdvisor exports and Grafana
+            # plots. If the cgroup files aren't readable (never the case
+            # inside a k8s pod) skip the gauge and the nudger this cycle
+            # rather than publish a wrong number.
+            cgroup_mb = read_cgroup_working_set_mb()
+            if cgroup_mb is not None:
+                ACTUAL_RAM.set(cgroup_mb)
+
+            # CPU: keep a 15s sliding window of cumulative usage_usec readings
+            # and compute the gauge as (newest - oldest) / wall-clock — a
+            # rolling 15s average, which smooths over stress-ng's bursty load
+            # cycles. (A psutil per-process sum would miss stress-ng's
+            # ephemeral worker children and systematically under-read.)
             cur_cgroup_cpu_usec = read_cgroup_cpu_usec()
             if cur_cgroup_cpu_usec is not None:
                 cgroup_cpu_samples.append((now, cur_cgroup_cpu_usec))
@@ -322,23 +268,17 @@ def sampler_loop(interval: float = 1.0) -> None:
                     t1, u1 = cgroup_cpu_samples[-1]
                     if t1 > t0:
                         last_cgroup_cpu_mc = (u1 - u0) / (t1 - t0) / 1000.0
-            last_per_proc_breakdown = per_proc
-
-            # Prefer cgroup; fall back to psutil only if cgroup isn't readable.
             if last_cgroup_cpu_mc is not None:
                 ACTUAL_CPU.set(last_cgroup_cpu_mc)
-            else:
-                ACTUAL_CPU.set(cpu_pct * 10.0)
             STRESS_CPU.set(loads.CPU_STRESS_MC)
 
-            if now - last_ram_adjust >= RAM_ADJUST_INTERVAL_S:
+            if cgroup_mb is not None and now - last_ram_adjust >= RAM_ADJUST_INTERVAL_S:
                 last_ram_adjust = now
-                _adjust_ram(actual_ram_mb)
+                _adjust_ram(cgroup_mb)
 
-            # CPU feedback step. Only when cgroup CPU is available — the psutil
-            # fallback under-reads stress-ng and would drive a runaway. The
-            # interval is >= the rolling window so each step reads a settled
-            # measurement of the previous change (see _adjust_cpu).
+            # CPU feedback step. The interval is >= the rolling window so each
+            # step reads a settled measurement of the previous change (see
+            # _adjust_cpu).
             if (last_cgroup_cpu_mc is not None
                     and now - last_cpu_adjust >= CPU_ADJUST_INTERVAL_S):
                 last_cpu_adjust = now
@@ -351,22 +291,13 @@ def sampler_loop(interval: float = 1.0) -> None:
                     s_running = STATE.get("running", False)
                 buf_mb = (len(loads.RAM_BUFFER) / (1024 * 1024)
                           if loads.RAM_BUFFER is not None else 0.0)
-                log.info("Sampler heartbeat: actual=%.1fMB (cgroup=%s psutil=%.1f) "
-                         "target=%.1fMB running=%s buf=%.1fMB",
-                         actual_ram_mb,
+                log.info("Sampler heartbeat: ram=%sMB target=%.1fMB cpu=%s "
+                         "stress=%.0fm running=%s buf=%.1fMB",
                          f"{cgroup_mb:.1f}" if cgroup_mb is not None else "n/a",
-                         psutil_rss_mb, s_target, s_running, buf_mb)
-                # Per-process CPU breakdown + cgroup truth. Diagnostic.
-                breakdown_str = ", ".join(
-                    f"{name}({pid})={pct:.0f}%"
-                    for (pid, name, pct) in last_per_proc_breakdown
-                    if pct > 0.1 or name in ("python", "stress-ng")
-                )
-                log.info("CPU debug: psutil_total=%.0fm cgroup=%s breakdown=[%s]",
-                         cpu_pct * 10,
+                         s_target,
                          (f"{last_cgroup_cpu_mc:.0f}m"
                           if last_cgroup_cpu_mc is not None else "n/a"),
-                         breakdown_str)
+                         loads.CPU_STRESS_MC, s_running, buf_mb)
 
             # Egress-only accounting so ACTUAL_NET matches what the net
             # formula targets. The formula controls how much traffic this
