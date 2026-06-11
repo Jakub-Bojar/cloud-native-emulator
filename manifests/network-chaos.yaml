@@ -1,0 +1,79 @@
+# Inter-tier network latency via Chaos Mesh (replaces the old hand-rolled
+# tc-netem DaemonSet). Each NetworkChaos selects emulator pods by the TIER
+# NODE LABEL of the node they run on, and delays traffic to/from pods of the
+# peer tier. `direction: both` applies the latency on egress at each end, so
+# RTT between two tiers = 2 x latency:
+#
+#   edge <-> cloud : 50ms each way -> 100ms RTT
+#   fog  <-> cloud : 20ms each way ->  40ms RTT
+#   edge <-> fog   :  5ms each way ->  10ms RTT
+#
+# No `duration` means the chaos runs until the resource is deleted. Cleanup
+# is automatic: deleting a NetworkChaos removes its tc rules from the pods
+# (the failure mode the old DaemonSet had — orphaned qdiscs — can't happen).
+#
+# Apply / remove:
+#   kubectl apply -f manifests/network-chaos.yaml
+#   kubectl delete -f manifests/network-chaos.yaml
+# Chaos Mesh UI (experiment status, pause/resume):
+#   kubectl port-forward -n chaos-mesh svc/chaos-dashboard 2333:2333
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: latency-edge-cloud
+  namespace: cloud-native-emulator
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: ["cloud-native-emulator"]
+    nodeSelectors: { tier: edge }
+  target:
+    mode: all
+    selector:
+      namespaces: ["cloud-native-emulator"]
+      nodeSelectors: { tier: cloud }
+  direction: both
+  delay:
+    latency: "50ms"
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: latency-fog-cloud
+  namespace: cloud-native-emulator
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: ["cloud-native-emulator"]
+    nodeSelectors: { tier: fog }
+  target:
+    mode: all
+    selector:
+      namespaces: ["cloud-native-emulator"]
+      nodeSelectors: { tier: cloud }
+  direction: both
+  delay:
+    latency: "20ms"
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: latency-edge-fog
+  namespace: cloud-native-emulator
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: ["cloud-native-emulator"]
+    nodeSelectors: { tier: edge }
+  target:
+    mode: all
+    selector:
+      namespaces: ["cloud-native-emulator"]
+      nodeSelectors: { tier: fog }
+  direction: both
+  delay:
+    latency: "5ms"
