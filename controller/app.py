@@ -18,25 +18,34 @@ liveness probe on /health. The single-threaded HTTPServer used to
 serialise everything, so a long materialise could starve /health and get
 the pod killed mid-operation.
 
+One controller manages exactly ONE template (this site's topology), so the
+template routes are singular and take no name — the template's `name` field
+still exists internally because the k8s resource names are derived from it.
+
 Endpoints
 ---------
-POST   /templates          materialise a posted template
-GET    /templates          list names of currently materialised templates
-GET    /templates/<name>   inspect a materialised template (peers, replicas)
-PATCH  /templates/<name>   partial update — merge, re-resolve, re-materialise.
+POST   /template           materialise the posted template. Re-POSTing the
+                           same name re-materialises idempotently; 409 if a
+                           different template is already materialised
+GET    /template           the materialised template, in full (404 if none)
+PATCH  /template           partial update — merge, re-resolve, re-materialise.
                            Change anything: x, a role's cpu/ram/net/count/tier,
                            or edges. Accepts nested JSON or dot-path shorthand,
                            e.g. {"x": 80, "roles.ingest.cpu.a": 6}
-DELETE /templates/<name>   tear down a materialised template
-GET    /graph/<name>       Grafana Node Graph payload (nodes + measured edges);
+DELETE /template           tear down the materialised template
+GET    /graph              Grafana Node Graph payload (nodes + measured edges);
                            ?view=pods for per-pod nodes (default: per-role)
-GET    /health             liveness for k8s
 
-Unified site API (see api.py / API.md)
---------------------------------------
-GET    /api/v1/overview                              site-wide snapshot
-GET    /api/v1/templates/<name>/status               fused k8s + live metrics
-GET    /api/v1/templates/<name>/summary              CPU/RAM/net averaged over a window
+Observability (see api.py / API.md)
+-----------------------------------
+GET    /overview               site-wide snapshot; subsumes the old /health
+                               ("ok": true). The k8s readiness probe uses a
+                               TCP-socket check instead (see controller.yaml)
+GET    /measurements/now       fused k8s + live worker metrics, instantaneous
+GET    /measurements/range     CPU/RAM/net aggregated between ?start and ?end
+                               (ISO 8601 or unix; default: the last 15 min)
+GET    /measurements/periods   the same range split into consecutive
+                               ?chunk-sized periods, each aggregated separately
 
 Interactive docs (generated from the code, no hand-maintained spec):
 GET    /docs   and   GET /openapi.json
@@ -45,12 +54,13 @@ GET    /docs   and   GET /openapi.json
 import logging
 import os
 import threading
-from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 import api
@@ -70,18 +80,11 @@ log = logging.getLogger(__name__)
 CORS_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")
 
 
-# ── Per-template lock ───────────────────────────────────────────────────────
-# Endpoints run concurrently in the threadpool, so two writes to the SAME
-# template could interleave (two POSTs, a PATCH racing the watcher's reconcile
-# in watcher.py). Serialise writes per template name; different templates and
-# all reads still run fully in parallel. Pure-read endpoints don't take it.
-_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
-_locks_guard = threading.Lock()
-
-
-def _template_lock(name: str) -> threading.Lock:
-    with _locks_guard:
-        return _locks[name]
+# ── Write lock ──────────────────────────────────────────────────────────────
+# Endpoints run concurrently in the threadpool, so two writes could
+# interleave (POST racing PATCH, double POST). One controller manages one
+# template, so a single lock serialises all writers; reads don't take it.
+_write_lock = threading.Lock()
 
 
 @asynccontextmanager
@@ -99,6 +102,7 @@ app = FastAPI(
     title="Cloud-Native Emulator Controller",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url=None,  # served by the dark-mode /docs route below
 )
 
 app.add_middleware(
@@ -107,6 +111,27 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
+
+
+# ── Dark-mode Swagger UI ─────────────────────────────────────────────────────
+# Swagger UI has no built-in dark theme, so we serve FastAPI's stock /docs
+# page with an inversion filter appended: flip the whole UI to dark, then
+# flip syntax-highlighted code blocks back so they keep their own colours.
+# hue-rotate(180deg) restores the original hues (greens stay green, etc.).
+_DARK_CSS = """<style>
+  body { background-color: #0f1217; }
+  .swagger-ui { filter: invert(88%) hue-rotate(180deg); }
+  .swagger-ui .microlight { filter: invert(100%) hue-rotate(180deg); }
+</style>"""
+
+
+@app.get("/docs", include_in_schema=False)
+def swagger_docs() -> HTMLResponse:
+    html = get_swagger_ui_html(
+        openapi_url="/openapi.json",
+        title=f"{app.title} — docs",
+    ).body.decode()
+    return HTMLResponse(html.replace("</head>", _DARK_CSS + "</head>"))
 
 
 # ── Error mapping ───────────────────────────────────────────────────────────
@@ -159,105 +184,207 @@ class Template(BaseModel):
     edges: list[Edge] = []
 
 
-# ── Templates: CRUD ──────────────────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"ok": True}
+def _stamp(payload: dict) -> dict:
+    """Prepend a generation timestamp (controller-local ISO 8601) to a JSON
+    response. Every endpoint except /graph returns through this — /graph's
+    shape is dictated by the Grafana Node Graph panel, which rejects unknown
+    top-level keys."""
+    return {"timestamp": api.timestamp(), **payload}
 
 
-@app.get("/templates")
-def list_templates():
-    return {"templates": materialiser.list_managed()}
+# ── The template: singular CRUD ──────────────────────────────────────────────
+def _single_template_name() -> str:
+    """Name of the one materialised template. 404 if none. 409 if the cluster
+    somehow holds more than one (e.g. legacy state from the old plural API, or
+    several labelled ConfigMaps picked up by the watcher) — surfacing that
+    beats silently picking one."""
+    names = materialiser.list_managed()
+    if not names:
+        raise HTTPException(404, "no template materialised")
+    if len(names) > 1:
+        raise HTTPException(
+            409, f"multiple templates materialised ({', '.join(names)}); "
+                 "tear down the extras first")
+    return names[0]
 
 
-@app.get("/templates/{name}")
-def get_template(name: str):
-    info = materialiser.get_managed(name)
-    if info is None:
-        raise HTTPException(404, f"no template named {name!r}")
-    return info["template"]
+@app.get("/template")
+def get_template():
+    info = materialiser.get_managed(_single_template_name())
+    if info is None or not info.get("template"):
+        raise HTTPException(404, "no template materialised")
+    return _stamp(info["template"])
 
 
-@app.post("/templates", status_code=201)
+@app.post("/template", status_code=201)
 def create_template(template: Template):
     body = template.model_dump(by_alias=True)
+    # GET /template responses carry an injected `timestamp`; strip it here so
+    # re-POSTing a GET round-trips cleanly instead of storing the stamp as
+    # template content (extra="allow" would otherwise keep it).
+    body.pop("timestamp", None)
     # Cycle detection + edge-endpoint checks beyond Pydantic's shape check.
     materialiser.validate(body)
-    log.info("Materialising template %s", body.get("name"))
-    with _template_lock(body["name"]):
+    with _write_lock:
+        # Singleton invariant: re-POSTing the same name re-materialises
+        # idempotently; a different name while one exists is a conflict.
+        existing = materialiser.list_managed()
+        if existing and existing != [body["name"]]:
+            raise HTTPException(
+                409, f"template {existing[0]!r} is already materialised; "
+                     "PATCH it, or DELETE it before posting a new one")
+        log.info("Materialising template %s", body.get("name"))
         materialiser.materialise(body)
-    return {
+    return _stamp({
         "name": body["name"],
         "roles": list(body["roles"].keys()),
         "peers": materialiser.compute_peers(body),
-    }
+    })
 
 
-@app.patch("/templates/{name}")
-def patch_template(name: str, patch: dict):
+@app.patch("/template")
+def patch_template(patch: dict):
     # Body is free-form: supports nested JSON and dot-path shorthand, so it is
     # not modelled. patch_template raises ValueError (→400) / RuntimeError (→502).
-    with _template_lock(name):
+    patch.pop("timestamp", None)  # injected by GET /template; not content
+    with _write_lock:
+        name = _single_template_name()
         merged = materialiser.patch_template(name, patch)
     if merged is None:
-        raise HTTPException(404, f"no template named {name!r}")
-    return {
+        raise HTTPException(404, "no template materialised")
+    return _stamp({
         "name": name,
         "template": merged,
         "peers": materialiser.compute_peers(merged),
-    }
+    })
 
 
-@app.delete("/templates/{name}")
-def delete_template(name: str):
-    with _template_lock(name):
-        # 404 on an unknown name so "deleted nothing because it was already
-        # gone" is distinguishable from a real teardown; the check shares the
-        # lock so a concurrent DELETE can't slip between check and teardown.
-        if materialiser.get_managed(name) is None:
-            raise HTTPException(404, f"no template named {name!r}")
+@app.delete("/template")
+def delete_template():
+    # _single_template_name 404s when nothing is materialised, so "deleted
+    # nothing because it was already gone" stays distinguishable from a real
+    # teardown; resolving it under the lock keeps check-then-delete atomic.
+    with _write_lock:
+        name = _single_template_name()
         log.info("Tearing down template %s", name)
         deleted = materialiser.teardown(name)
-    return {"name": name, "deleted": deleted}
+    return _stamp({"name": name, "deleted": deleted})
 
 
 # ── Graph ─────────────────────────────────────────────────────────────────────
-@app.get("/graph/{name}")
-def get_graph(name: str, view: str = "role"):
+@app.get("/graph")
+def get_graph(
+    view: str = Query(
+        "role",
+        description="`role` (default): one node per role, stats summed "
+                    "across its pods. `pods`: one node per pod with raw "
+                    "pod→pod edges.",
+        examples=["pods"],
+    ),
+):
+    """Grafana Node Graph payload (nodes + measured edges) for the
+    materialised template. No timestamp — the panel rejects unknown keys."""
     by_pod = view.lower() in ("pod", "pods")
-    payload = graph.build_graph(name, by_pod=by_pod)
+    payload = graph.build_graph(_single_template_name(), by_pod=by_pod)
     if payload is None:
-        raise HTTPException(404, f"no template named {name!r}")
+        raise HTTPException(404, "no template materialised")
     return payload
 
 
-# ── Unified /api/v1 site API ───────────────────────────────────────────────────
-@app.get("/api/v1/overview")
+# ── Observability ─────────────────────────────────────────────────────────────
+@app.get("/overview")
 def overview():
-    return api.overview()
+    # "ok" subsumes the old /health endpoint: if this handler runs, the web
+    # layer is alive. The rest is the site snapshot from api.overview().
+    return _stamp({"ok": True, **api.overview()})
 
 
-@app.get("/api/v1/templates/{name}/status")
-def template_status(name: str):
-    data = api.template_status(name)
+@app.get("/measurements/now")
+def measurements_now():
+    data = api.template_status(_single_template_name())
     if data is None:
-        raise HTTPException(404, f"no template named {name!r}")
-    return data
+        raise HTTPException(404, "no template materialised")
+    return _stamp(data)
 
 
-@app.get("/api/v1/templates/{name}/summary")
-def template_summary(
-    name: str,
-    range: str = "15m",
-    resources: str | None = None,
-    by_role: bool = False,
-    include_x: bool = False,
+@app.get("/measurements/range")
+def measurements_range(
+    start: datetime | None = Query(
+        None,
+        description="Interval start — ISO 8601 (`2026-06-10T11:00:00`) or "
+                    "unix epoch seconds (`1781089200`). A timestamp without "
+                    "an offset is the controller's local time (TZ env, e.g. "
+                    "Europe/London); `Z` / explicit offsets are honoured. "
+                    "Defaults to `end` − 15 minutes.",
+        examples=["2026-06-10T11:00:00"],
+    ),
+    end: datetime | None = Query(
+        None,
+        description="Interval end, same formats as `start`. Defaults to now.",
+        examples=["2026-06-10T12:00:00"],
+    ),
+    resources: str | None = Query(
+        None,
+        description="Comma-separated subset of: `cpu`, `ram`, `net`. "
+                    "Defaults to all three.",
+        examples=["cpu,net"],
+    ),
 ):
+    """CPU / RAM / network aggregated between `start` and `end`.
+
+    Per requested resource: template-wide target/actual averages plus actual
+    min/max, summed across pods first, with a per-role breakdown and each
+    role's resolved input x averaged over the interval. Omit both timestamps
+    for the last 15 minutes."""
     res = ([r.strip() for r in resources.split(",") if r.strip()]
            if resources else None)
-    # template_summary raises ValueError on an unknown resource (→400).
-    data = api.template_summary(name, range, resources=res,
-                                by_role=by_role, include_x=include_x)
+    # template_range raises ValueError on an unknown resource, start >= end,
+    # or an oversized window (→400).
+    data = api.template_range(_single_template_name(), start=start, end=end,
+                              resources=res)
     if data is None:
-        raise HTTPException(404, f"no template named {name!r}")
-    return data
+        raise HTTPException(404, "no template materialised")
+    return _stamp(data)
+
+
+@app.get("/measurements/periods")
+def measurements_periods(
+    start: datetime | None = Query(
+        None,
+        description="Range start — same formats and defaults as "
+                    "`/measurements/range`.",
+        examples=["2026-06-10T11:00:00"],
+    ),
+    end: datetime | None = Query(
+        None,
+        description="Range end, same formats as `start`. Defaults to now.",
+        examples=["2026-06-10T12:00:00"],
+    ),
+    chunk: str = Query(
+        ...,
+        description="Length of each chunk — e.g. `90s`, `10m`, `1h` (min "
+                    "`30s`, the scrape interval). The range is split into as "
+                    "many FULL chunks as fit; a trailing remainder is "
+                    "dropped and reported as `remainder_s`.",
+        examples=["10m"],
+    ),
+    resources: str | None = Query(
+        None,
+        description="Comma-separated subset of: `cpu`, `ram`, `net`. "
+                    "Defaults to all three.",
+        examples=["cpu,net"],
+    ),
+):
+    """The range split into consecutive `chunk`-sized periods, each
+    aggregated separately.
+
+    e.g. `?start=11:00&end=12:00&chunk=10m` → 6 ten-minute periods, each with
+    the same totals/roles/x blocks as `/measurements/range`."""
+    res = ([r.strip() for r in resources.split(",") if r.strip()]
+           if resources else None)
+    # template_periods raises ValueError on bad chunking/resources/interval (→400).
+    data = api.template_periods(_single_template_name(), start=start, end=end,
+                                chunk=chunk, resources=res)
+    if data is None:
+        raise HTTPException(404, "no template materialised")
+    return _stamp(data)

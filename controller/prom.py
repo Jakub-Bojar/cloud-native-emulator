@@ -50,19 +50,25 @@ def _get(path: str, params: dict) -> dict | None:
         return None
 
 
-def instant(query: str) -> dict | None:
-    """Run an instant PromQL query. Returns the raw Prometheus JSON, or None."""
-    return _get("/api/v1/query", {"query": query})
+def instant(query: str, at: float | None = None) -> dict | None:
+    """Run an instant PromQL query, optionally evaluated at unix time `at`
+    instead of now. Returns the raw Prometheus JSON, or None."""
+    params = {"query": query}
+    if at is not None:
+        params["time"] = f"{at:.3f}"
+    return _get("/api/v1/query", params)
 
 
-def instant_scalar(query: str) -> float | None:
+def instant_scalar(query: str, at: float | None = None) -> float | None:
     """Run an instant query expected to reduce to a single number and return
     that number, or None.
 
-    Used for summary aggregations like `avg_over_time(sum(metric)[15m:])`,
-    which evaluate to a one-element instant vector. NaN/Inf collapse to None
-    so the result is always valid JSON."""
-    data = instant(query)
+    Used for range aggregations like `avg_over_time(sum(metric)[900s:])`,
+    which evaluate to a one-element instant vector. Passing `at` pins the
+    evaluation time, so a trailing-window subquery becomes "over the interval
+    ending at `at`". NaN/Inf collapse to None so the result is always valid
+    JSON."""
+    data = instant(query, at=at)
     if not data or data.get("status") != "success":
         return None
     result = data.get("data", {}).get("result", [])

@@ -21,7 +21,8 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import quote
 
 import graph
@@ -43,6 +44,18 @@ _GAUGE_MAP = {
 }
 
 
+# Timezone for the human-facing side of /measurements/range: naive request
+# timestamps are interpreted in it and response timestamps are rendered in it
+# (with their UTC offset, so they stay unambiguous). Set TZ on the controller
+# pod, e.g. "Europe/London"; everything internal still computes in absolute
+# unix time, so this is presentation only.
+try:
+    LOCAL_TZ = ZoneInfo(os.environ.get("TZ", "UTC"))
+except ZoneInfoNotFoundError:
+    log.warning("unknown TZ %r — falling back to UTC", os.environ.get("TZ"))
+    LOCAL_TZ = ZoneInfo("UTC")
+
+
 def site_block() -> dict:
     """Identity of this controller's site. Tags every response so a fleet-wide
     gateway can attribute and merge data across VMs later."""
@@ -50,6 +63,12 @@ def site_block() -> dict:
         "id": os.environ.get("SITE_ID", "local"),
         "tier": os.environ.get("SITE_TIER", "unknown"),
     }
+
+
+def timestamp() -> str:
+    """Now, in the controller's local timezone, ISO 8601 with offset.
+    Stamped onto every JSON response (see app._stamp)."""
+    return datetime.now(LOCAL_TZ).isoformat(timespec="seconds")
 
 
 # ----------------------------------------------------------------------------
@@ -245,7 +264,7 @@ def template_status(name: str) -> dict | None:
 
 
 # ----------------------------------------------------------------------------
-# Summary: CPU / RAM / network averaged over a window
+# Range: CPU / RAM / network aggregated between two points in time
 # ----------------------------------------------------------------------------
 
 # resource key → (friendly output key + unit, actual gauge, target gauge).
@@ -255,69 +274,69 @@ _RESOURCE_METRICS = {
     "ram": ("ram_mb", "worker_actual_ram_mb", "worker_target_ram_mb"),
     "net": ("net_mbps", "worker_actual_net_mbps", "worker_target_net_mbps"),
 }
-_DURATION_RE = re.compile(r"^\d+[smhd]$")
 
-
-def _safe_duration(s: str) -> str:
-    """Only allow a bare Prometheus duration so it can be embedded in a
-    subquery range without injection. Falls back to 15m."""
-    return s if isinstance(s, str) and _DURATION_RE.match(s) else "15m"
+# Hard cap on end - start. A subquery walks every sample in the window, so an
+# unbounded interval would let one request make Prometheus chew through months
+# of series. 31 days covers any plausible experiment.
+_MAX_WINDOW_S = 31 * 24 * 3600
 
 
 def _round(v):
     return round(v, 3) if isinstance(v, (int, float)) else v
 
 
-def template_summary(name: str, range_str: str = "15m", resources=None,
-                     by_role: bool = False, include_x: bool = False) -> dict | None:
-    """Compact CPU/RAM/network summary for a template, averaged over a window.
-
-    For each requested resource it reports the template-wide target and actual
-    *summed across pods*, then reduced over the window: actual gets avg / min /
-    max, target gets avg. With by_role=True it also breaks the per-resource
-    averages down by role. With include_x=True an `x` block is added mapping
-    each role to its resolved input x (averaged over the window). None if no
-    such template; graceful degradation if Prometheus is unreachable.
-
-    Raises ValueError on an unknown resource → caller maps to 400.
-    """
-    info = materialiser.get_managed(name)
-    if info is None:
+def _as_local(dt: datetime | None) -> datetime | None:
+    """Normalise to aware local time (LOCAL_TZ); a naive datetime is taken
+    to already BE local. Aware datetimes (Z / explicit offset) keep their
+    instant and are converted for display."""
+    if dt is None:
         return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=LOCAL_TZ)
+    return dt.astimezone(LOCAL_TZ)
 
-    if resources:
-        unknown = [r for r in resources if r not in _RESOURCE_METRICS]
-        if unknown:
-            raise ValueError(
-                f"unknown resource(s) {unknown}; valid: cpu, ram, net")
-        wanted = list(dict.fromkeys(resources))  # de-dupe, keep order
-    else:
-        wanted = ["cpu", "ram", "net"]
 
-    window = _safe_duration(range_str)
-    envelope = {
-        "site": site_block(),
-        "name": name,
-        "range": window,
-    }
-    roles = (info.get("template") or {}).get("roles") or {}
+def _wanted_resources(resources) -> list[str]:
+    """Validate/normalise the resources filter; defaults to all three."""
+    if not resources:
+        return ["cpu", "ram", "net"]
+    unknown = [r for r in resources if r not in _RESOURCE_METRICS]
+    if unknown:
+        raise ValueError(f"unknown resource(s) {unknown}; valid: cpu, ram, net")
+    return list(dict.fromkeys(resources))  # de-dupe, keep order
 
-    if not prom.available():
-        envelope["prometheus"] = {"available": False, "url": prom.url()}
-        envelope["totals"] = {}
-        if by_role:
-            envelope["roles"] = {}
-        if include_x:
-            envelope["x"] = {}
-        return envelope
 
+def _resolve_interval(start: datetime | None,
+                      end: datetime | None) -> tuple[datetime, datetime, int]:
+    """Apply defaults (end=now, start=end-15m), validate, return
+    (start_dt, end_dt, window_seconds) in local time."""
+    end_dt = _as_local(end) or datetime.now(LOCAL_TZ)
+    start_dt = _as_local(start) or end_dt - timedelta(minutes=15)
+    window_s = int((end_dt - start_dt).total_seconds())
+    if window_s <= 0:
+        raise ValueError("start must be before end")
+    if window_s > _MAX_WINDOW_S:
+        raise ValueError(f"window too large: {window_s}s (max {_MAX_WINDOW_S}s)")
+    return start_dt, end_dt, window_s
+
+
+def _interval_stats(name: str, roles: dict, wanted: list[str],
+                    window_s: int, at: float) -> dict:
+    """totals / roles / x blocks for ONE interval of `window_s` seconds
+    ending at unix time `at`.
+
+    The trailing-window subquery `fn(sum(metric)[<w>:])` is evaluated AT
+    `at`, which turns "last w from now" into "the w seconds ending at `at`".
+    Sum across pods first, then reduce over time, so each number is "the
+    whole role/template's usage over the interval". The window string is
+    built from a validated int, so it is safe to embed in PromQL.
+    """
     ns = k8s.namespace()
+    window = f"{int(window_s)}s"
 
     def agg(metric: str, scope: str, fn: str):
-        # Sum across pods first, then reduce over time via a subquery so the
-        # number is "the whole role/template's usage, averaged over the window".
         return _round(prom.instant_scalar(
-            f"{fn}(sum({metric}{{{scope}}})[{window}:])"))
+            f"{fn}(sum({metric}{{{scope}}})[{window}:])", at=at))
 
     def block(scope: str, full: bool) -> dict:
         out: dict[str, dict] = {}
@@ -333,21 +352,147 @@ def template_summary(name: str, range_str: str = "15m", resources=None,
             out[key] = entry
         return out
 
-    envelope["totals"] = block(f'namespace="{ns}",pod=~"wt-{name}-.*"', full=True)
-    if by_role:
-        envelope["roles"] = {
-            role: block(f'namespace="{ns}",pod=~"wt-{name}-{role}-.*"',
-                        full=False)
-            for role in roles
-        }
-    if include_x:
-        # x is the same on every pod of a role, so average (not sum) across the
-        # role's pods to recover that role's resolved input x.
-        def x_of(role: str):
-            scope = f'namespace="{ns}",pod=~"wt-{name}-{role}-.*"'
-            return _round(prom.instant_scalar(
-                f"avg_over_time(avg(worker_input_x{{{scope}}})[{window}:])"))
-        envelope["x"] = {role: x_of(role) for role in roles}
+    # x is the same on every pod of a role, so average (not sum) across the
+    # role's pods to recover that role's resolved input x.
+    def x_of(role: str):
+        scope = f'namespace="{ns}",pod=~"wt-{name}-{role}-.*"'
+        return _round(prom.instant_scalar(
+            f"avg_over_time(avg(worker_input_x{{{scope}}})[{window}:])",
+            at=at))
+
+    return {
+        "totals": block(f'namespace="{ns}",pod=~"wt-{name}-.*"', full=True),
+        "roles": {role: block(f'namespace="{ns}",pod=~"wt-{name}-{role}-.*"',
+                              full=False)
+                  for role in roles},
+        "x": {role: x_of(role) for role in roles},
+    }
+
+
+def template_range(name: str, start: datetime | None = None,
+                   end: datetime | None = None,
+                   resources=None) -> dict | None:
+    """CPU/RAM/network for a template, aggregated between `start` and `end`.
+
+    Defaults give "the last 15 minutes". For each requested resource it
+    reports the template-wide target and actual *summed across pods*, then
+    reduced over [start, end]: actual gets avg / min / max, target gets avg —
+    plus the per-role breakdown and an `x` block mapping each role to its
+    resolved input x (averaged over the interval). None if no such template;
+    graceful degradation if Prometheus is unreachable.
+
+    Raises ValueError on an unknown resource, start >= end, or a window
+    beyond _MAX_WINDOW_S → caller maps to 400.
+    """
+    info = materialiser.get_managed(name)
+    if info is None:
+        return None
+    wanted = _wanted_resources(resources)
+    start_dt, end_dt, window_s = _resolve_interval(start, end)
+
+    envelope = {
+        "site": site_block(),
+        "name": name,
+        "start": start_dt.isoformat(timespec="seconds"),
+        "end": end_dt.isoformat(timespec="seconds"),
+        "window": f"{window_s}s",
+    }
+    roles = (info.get("template") or {}).get("roles") or {}
+
+    if not prom.available():
+        envelope.update(totals={}, roles={}, x={})
+        envelope["prometheus"] = {"available": False, "url": prom.url()}
+        return envelope
+
+    envelope.update(_interval_stats(name, roles, wanted, window_s,
+                                    end_dt.timestamp()))
+    envelope["prometheus"] = {"available": True, "url": prom.url()}
+    return envelope
+
+
+# Cap on chunks per request: each chunk costs its own batch of Prometheus
+# queries (~40 for a 4-role template), so 100 chunks ≈ 4k instant queries —
+# slow but tolerable; beyond that, refuse rather than melt.
+_MAX_PERIODS = 100
+
+_DUR_RE = re.compile(r"^(\d+)(s|m|h|d)?$")
+
+
+def _parse_duration(s: str) -> int:
+    """'90s' / '10m' / '1h' / '2d' (bare number = seconds) → seconds."""
+    m = _DUR_RE.match(s.strip())
+    if not m:
+        raise ValueError(f"bad duration {s!r}; use e.g. 90s, 10m, 1h")
+    return int(m.group(1)) * {"s": 1, "m": 60,
+                              "h": 3600, "d": 86400}[m.group(2) or "s"]
+
+
+def template_periods(name: str, start: datetime | None = None,
+                     end: datetime | None = None, chunk: str | None = None,
+                     resources=None) -> dict | None:
+    """Split [start, end] into consecutive FULL chunks of `chunk` each, and
+    aggregate each one separately.
+
+    Chunks are anchored at `start`; a trailing remainder shorter than `chunk`
+    is dropped and reported as remainder_s. Each period carries its own
+    start/end plus the same totals/roles/x blocks as template_range. Chunks
+    shorter than 30s (the Prometheus scrape interval) are rejected — they
+    would hold at most one sample.
+
+    Returns None if no such template. Raises ValueError on a missing/bad
+    chunk, resources, or interval → caller maps to 400.
+    """
+    info = materialiser.get_managed(name)
+    if info is None:
+        return None
+    wanted = _wanted_resources(resources)
+    start_dt, end_dt, window_s = _resolve_interval(start, end)
+
+    if not chunk:
+        raise ValueError("chunk is required, e.g. chunk=10m")
+    chunk_s = _parse_duration(chunk)
+    if chunk_s < 30:
+        raise ValueError("chunk must be >= 30s (the scrape interval)")
+    count = window_s // chunk_s
+    if count == 0:
+        raise ValueError(
+            f"chunk {chunk_s}s is longer than the {window_s}s range")
+    if count > _MAX_PERIODS:
+        raise ValueError(
+            f"too many chunks ({count}, max {_MAX_PERIODS}) — use a larger "
+            "chunk or a narrower range")
+    remainder_s = window_s - count * chunk_s
+
+    envelope = {
+        "site": site_block(),
+        "name": name,
+        "start": start_dt.isoformat(timespec="seconds"),
+        "end": end_dt.isoformat(timespec="seconds"),
+        "window": f"{window_s}s",
+        "chunk": f"{chunk_s}s",
+        "count": count,
+    }
+    if remainder_s:
+        envelope["remainder_s"] = remainder_s
+    roles = (info.get("template") or {}).get("roles") or {}
+
+    if not prom.available():
+        envelope["periods"] = []
+        envelope["prometheus"] = {"available": False, "url": prom.url()}
+        return envelope
+
+    periods = []
+    for i in range(count):
+        p_start = start_dt + timedelta(seconds=i * chunk_s)
+        p_end = p_start + timedelta(seconds=chunk_s)
+        stats = _interval_stats(name, roles, wanted, chunk_s,
+                                p_end.timestamp())
+        periods.append({
+            "start": p_start.isoformat(timespec="seconds"),
+            "end": p_end.isoformat(timespec="seconds"),
+            **stats,
+        })
+    envelope["periods"] = periods
     envelope["prometheus"] = {"available": True, "url": prom.url()}
     return envelope
 

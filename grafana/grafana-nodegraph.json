@@ -1,10 +1,16 @@
 {
-  "title": "Emulator — Topology DAG",
+  "title": "Emulator \u2014 Topology DAG",
   "uid": "emulator-topology-dag",
-  "tags": ["emulator", "topology"],
+  "tags": [
+    "emulator",
+    "topology"
+  ],
   "schemaVersion": 39,
   "editable": true,
-  "time": { "from": "now-15m", "to": "now" },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
   "refresh": "5s",
   "templating": {
     "list": [
@@ -19,22 +25,25 @@
         "refresh": 1
       },
       {
-        "name": "template",
-        "type": "textbox",
-        "label": "Template name",
-        "query": "fanout",
-        "current": { "text": "fanout", "value": "fanout" },
-        "hide": 0
-      },
-      {
         "name": "view",
         "type": "custom",
         "label": "View",
         "query": "role,pods",
-        "current": { "text": "role", "value": "role" },
+        "current": {
+          "text": "role",
+          "value": "role"
+        },
         "options": [
-          { "text": "role", "value": "role", "selected": true },
-          { "text": "pods", "value": "pods", "selected": false }
+          {
+            "text": "role",
+            "value": "role",
+            "selected": true
+          },
+          {
+            "text": "pods",
+            "value": "pods",
+            "selected": false
+          }
         ],
         "hide": 0
       }
@@ -44,13 +53,26 @@
     {
       "id": 1,
       "type": "nodeGraph",
-      "title": "Topology — $template",
-      "description": "Roles as nodes (CPU/RAM totals + CPU-saturation ring), measured iperf3 traffic as directed edges (Mbps). Sourced from the controller's GET /graph/<name>.",
-      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${infinity}" },
-      "gridPos": { "h": 18, "w": 24, "x": 0, "y": 0 },
+      "title": "Topology \u2014 $template",
+      "description": "Roles as nodes (CPU/RAM totals + CPU-saturation ring), measured iperf3 traffic as directed edges (Mbps). Sourced from the controller's GET /graph.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${infinity}"
+      },
+      "gridPos": {
+        "h": 18,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "options": {
-        "nodes": { "mainStatUnit": "", "secondaryStatUnit": "" },
-        "edges": { "mainStatUnit": "" }
+        "nodes": {
+          "mainStatUnit": "",
+          "secondaryStatUnit": ""
+        },
+        "edges": {
+          "mainStatUnit": ""
+        }
       },
       "fieldConfig": {
         "defaults": {},
@@ -59,42 +81,118 @@
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${infinity}" },
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "${infinity}"
+          },
           "type": "json",
           "source": "url",
           "format": "table",
-          "url": "/graph/${template}?view=${view}",
-          "url_options": { "method": "GET", "data": "" },
+          "url": "/graph?view=${view}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
           "root_selector": "nodes",
           "columns": [
-            { "selector": "id", "text": "id", "type": "string" },
-            { "selector": "title", "text": "title", "type": "string" },
-            { "selector": "subTitle", "text": "subTitle", "type": "string" },
-            { "selector": "mainStat", "text": "mainStat", "type": "string" },
-            { "selector": "secondaryStat", "text": "secondaryStat", "type": "string" },
-            { "selector": "color", "text": "color", "type": "string" },
-            { "selector": "detail__role", "text": "detail__role", "type": "string" },
-            { "selector": "detail__cpu_pct", "text": "detail__cpu_pct", "type": "number" },
-            { "selector": "detail__x", "text": "detail__x", "type": "number" },
-            { "selector": "detail__net_in_mbps", "text": "detail__net_in_mbps", "type": "number" },
-            { "selector": "detail__net_out_mbps", "text": "detail__net_out_mbps", "type": "number" },
-            { "selector": "detail__replicas", "text": "detail__replicas", "type": "number" }
+            {
+              "selector": "id",
+              "text": "id",
+              "type": "string"
+            },
+            {
+              "selector": "title",
+              "text": "title",
+              "type": "string"
+            },
+            {
+              "selector": "subTitle",
+              "text": "subTitle",
+              "type": "string"
+            },
+            {
+              "selector": "mainStat",
+              "text": "mainStat",
+              "type": "string"
+            },
+            {
+              "selector": "secondaryStat",
+              "text": "secondaryStat",
+              "type": "string"
+            },
+            {
+              "selector": "color",
+              "text": "color",
+              "type": "string"
+            },
+            {
+              "selector": "detail__role",
+              "text": "detail__role",
+              "type": "string"
+            },
+            {
+              "selector": "detail__cpu_pct",
+              "text": "detail__cpu_pct",
+              "type": "number"
+            },
+            {
+              "selector": "detail__x",
+              "text": "detail__x",
+              "type": "number"
+            },
+            {
+              "selector": "detail__net_in_mbps",
+              "text": "detail__net_in_mbps",
+              "type": "number"
+            },
+            {
+              "selector": "detail__net_out_mbps",
+              "text": "detail__net_out_mbps",
+              "type": "number"
+            },
+            {
+              "selector": "detail__replicas",
+              "text": "detail__replicas",
+              "type": "number"
+            }
           ]
         },
         {
           "refId": "B",
-          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${infinity}" },
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "${infinity}"
+          },
           "type": "json",
           "source": "url",
           "format": "table",
-          "url": "/graph/${template}?view=${view}",
-          "url_options": { "method": "GET", "data": "" },
+          "url": "/graph?view=${view}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
           "root_selector": "edges",
           "columns": [
-            { "selector": "id", "text": "id", "type": "string" },
-            { "selector": "source", "text": "source", "type": "string" },
-            { "selector": "target", "text": "target", "type": "string" },
-            { "selector": "mainStat", "text": "mainStat", "type": "string" }
+            {
+              "selector": "id",
+              "text": "id",
+              "type": "string"
+            },
+            {
+              "selector": "source",
+              "text": "source",
+              "type": "string"
+            },
+            {
+              "selector": "target",
+              "text": "target",
+              "type": "string"
+            },
+            {
+              "selector": "mainStat",
+              "text": "mainStat",
+              "type": "string"
+            }
           ]
         }
       ]

@@ -102,19 +102,27 @@ spec:
             - containerPort: 8081
           env:
             # Site identity — this controller's place in the larger cloud system.
-            # Every /api/v1 response carries {id, tier} so a future federation
-            # gateway can merge data across VMs. Set per VM (edge / fog / cloud).
+            # Every observability response carries {id, tier} so a future
+            # federation gateway can merge data across VMs. Set per VM.
             - name: SITE_ID
               value: "local"
             - name: SITE_TIER
               value: "cloud"
+            # Local timezone for /measurements/range: naive request timestamps
+            # are interpreted in it and response timestamps rendered in it
+            # (with offset). Also localises log timestamps.
+            - name: TZ
+              value: "Europe/London"
             # Prometheus HTTP API base URL for the windowed /summary endpoint.
             # Depends on your kube-prometheus-stack release/namespace — adjust to
             # match. If unreachable, /summary degrades gracefully.
             - name: PROM_URL
               value: "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090"
+          # TCP check rather than HTTP: /health was merged into GET /overview,
+          # which does k8s API + Prometheus work — too heavy to hit every probe
+          # period. Accepting a TCP connection proves the web layer is up.
           readinessProbe:
-            httpGet: { path: /health, port: 8081 }
+            tcpSocket: { port: 8081 }
             periodSeconds: 2
 ---
 apiVersion: v1
