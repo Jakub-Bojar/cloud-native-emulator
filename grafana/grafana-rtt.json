@@ -1,0 +1,75 @@
+{
+  "uid": "emulator-peer-rtt",
+  "title": "Emulator — Inter-tier RTT",
+  "description": "Pod-to-peer round-trip times measured by the workers themselves (worker_peer_rtt_ms: one TCP handshake to each peer every 15s). Because it is measured pod-to-pod, it shows injected inter-tier latency (Chaos Mesh NetworkChaos) that node-level probes would miss. Expect roughly: edge->fog 10ms, fog->cloud 40ms, cloud->cloud <1ms, plus jitter under load.",
+  "tags": ["emulator", "latency"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-30m", "to": "now" },
+  "schemaVersion": 39,
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Datasource",
+        "hide": 0,
+        "current": {},
+        "options": [],
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Pod → peer RTT",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "custom": { "lineWidth": 2, "fillOpacity": 8, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "min", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "worker_peer_rtt_ms",
+          "legendFormat": "{{pod}} → {{peer}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Current RTT floor per link (min over 5m — closest to the injected latency)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 14 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "decimals": 1 },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min_over_time(worker_peer_rtt_ms[5m])",
+          "legendFormat": "{{pod}} → {{peer}}"
+        }
+      ]
+    }
+  ]
+}

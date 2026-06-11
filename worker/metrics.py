@@ -23,6 +23,7 @@ seeing — invaluable when diagnosing drift or a stalled sampler.
 
 import logging
 import os
+import socket
 import time
 from collections import deque
 
@@ -64,6 +65,13 @@ PEER_EGRESS = Gauge("worker_peer_egress_mbps",
                     "the iperf3 client's per-second interval reports. One "
                     "series per peer IP this pod is sending to.",
                     ["peer"])
+
+PEER_RTT = Gauge("worker_peer_rtt_ms",
+                 "TCP-handshake round-trip time to a peer pod (ms), probed "
+                 "against the peer's HTTP port every 15s. Measured pod-to-pod, "
+                 "so it includes injected inter-tier latency (Chaos Mesh / tc "
+                 "netem). One series per peer IP this pod sends to.",
+                 ["peer"])
 
 
 _CGROUP_PATHS: tuple[str, str, str] | None = None
@@ -129,6 +137,17 @@ def read_cgroup_working_set_mb() -> float | None:
                     break
         return max(0, current - inactive) / (1024 * 1024)
     except (OSError, ValueError):
+        return None
+
+
+def _probe_rtt_ms(ip: str, port: int = 8080, timeout: float = 1.0) -> float | None:
+    """One TCP handshake to the peer's always-listening HTTP port ≈ one
+    network round trip. None if the peer is unreachable within `timeout`."""
+    try:
+        t0 = time.monotonic()
+        with socket.create_connection((ip, port), timeout=timeout):
+            return (time.monotonic() - t0) * 1000.0
+    except OSError:
         return None
 
 
@@ -203,12 +222,16 @@ def sampler_loop(interval: float = 1.0) -> None:
     # and reflects configure()'s initial stress-ng size rather than startup 0s.
     last_cpu_adjust = time.monotonic()
     last_heartbeat = 0.0
+    last_rtt_probe = 0.0
     RAM_ADJUST_INTERVAL_S = 5.0
     HEARTBEAT_INTERVAL_S = 30.0
+    RTT_PROBE_INTERVAL_S = 15.0
 
     # Peer IPs we currently have a worker_peer_egress_mbps series for, so we
     # can remove series for peers that vanish after a reconfigure.
     published_peers: set[str] = set()
+    # Same bookkeeping for the worker_peer_rtt_ms series.
+    published_rtt_peers: set[str] = set()
 
     # Cgroup CPU is averaged over a rolling 15s window so the gauge
     # matches what kubectl top (and the Grafana dashboard's rate()[1m])
@@ -335,5 +358,23 @@ def sampler_loop(interval: float = 1.0) -> None:
                 except KeyError:
                     pass
             published_peers = set(peer_snapshot.keys())
+
+            # Probe per-peer RTT. Blocking, so on its own slow cadence with a
+            # 1s timeout — worst case (every peer down) stalls one sampler
+            # iteration by len(peers) seconds once per probe interval.
+            if now - last_rtt_probe >= RTT_PROBE_INTERVAL_S:
+                last_rtt_probe = now
+                with STATE_LOCK:
+                    rtt_peers = list(STATE.get("peers") or [])
+                for ip in rtt_peers:
+                    ms = _probe_rtt_ms(ip)
+                    if ms is not None:
+                        PEER_RTT.labels(peer=ip).set(ms)
+                for stale in published_rtt_peers - set(rtt_peers):
+                    try:
+                        PEER_RTT.remove(stale)
+                    except KeyError:
+                        pass
+                published_rtt_peers = set(rtt_peers)
         except Exception:
             log.exception("sampler iteration failed; continuing")
