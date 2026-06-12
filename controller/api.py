@@ -320,10 +320,25 @@ def _resolve_interval(start: datetime | None,
     return start_dt, end_dt, window_s
 
 
+def _source_roles(template: dict) -> set[str]:
+    """Roles with no inbound edge (self-edges ignored). These evaluate their
+    formulas at the template's own x; every other role's x is derived from
+    upstream egress (see materialiser._compute_resolved_x)."""
+    roles = set(template.get("roles") or {})
+    targets = {e.get("to") for e in (template.get("edges") or [])
+               if e.get("from") != e.get("to")}
+    return roles - targets
+
+
 def _interval_stats(name: str, roles: dict, wanted: list[str],
-                    window_s: int, at: float) -> dict:
+                    window_s: int, at: float,
+                    source_roles: set[str]) -> dict:
     """totals / roles / x blocks for ONE interval of `window_s` seconds
     ending at unix time `at`.
+
+    The `x` block is split by provenance: `input` holds the source roles
+    (their x IS the template's x) and `derived` holds the downstream roles
+    (x propagated from upstream egress).
 
     The trailing-window subquery `fn(sum(metric)[<w>:])` is evaluated AT
     `at`, which turns "last w from now" into "the w seconds ending at `at`".
@@ -360,12 +375,17 @@ def _interval_stats(name: str, roles: dict, wanted: list[str],
             f"avg_over_time(avg(worker_input_x{{{scope}}})[{window}:])",
             at=at))
 
+    x_input: dict = {}
+    x_derived: dict = {}
+    for role in roles:
+        (x_input if role in source_roles else x_derived)[role] = x_of(role)
+
     return {
         "totals": block(f'namespace="{ns}",pod=~"wt-{name}-.*"', full=True),
         "roles": {role: block(f'namespace="{ns}",pod=~"wt-{name}-{role}-.*"',
                               full=False)
                   for role in roles},
-        "x": {role: x_of(role) for role in roles},
+        "x": {"input": x_input, "derived": x_derived},
     }
 
 
@@ -377,9 +397,10 @@ def template_range(name: str, start: datetime | None = None,
     Defaults give "the last 15 minutes". For each requested resource it
     reports the template-wide target and actual *summed across pods*, then
     reduced over [start, end]: actual gets avg / min / max, target gets avg —
-    plus the per-role breakdown and an `x` block mapping each role to its
-    resolved input x (averaged over the interval). None if no such template;
-    graceful degradation if Prometheus is unreachable.
+    plus the per-role breakdown and an `x` block averaged over the interval,
+    split into `input` (source roles, set by the template's own x) and
+    `derived` (downstream roles, computed from upstream egress). None if no
+    such template; graceful degradation if Prometheus is unreachable.
 
     Raises ValueError on an unknown resource, start >= end, or a window
     beyond _MAX_WINDOW_S → caller maps to 400.
@@ -400,12 +421,13 @@ def template_range(name: str, start: datetime | None = None,
     roles = (info.get("template") or {}).get("roles") or {}
 
     if not prom.available():
-        envelope.update(totals={}, roles={}, x={})
+        envelope.update(totals={}, roles={}, x={"input": {}, "derived": {}})
         envelope["prometheus"] = {"available": False, "url": prom.url()}
         return envelope
 
     envelope.update(_interval_stats(name, roles, wanted, window_s,
-                                    end_dt.timestamp()))
+                                    end_dt.timestamp(),
+                                    _source_roles(info.get("template") or {})))
     envelope["prometheus"] = {"available": True, "url": prom.url()}
     return envelope
 
@@ -481,12 +503,13 @@ def template_periods(name: str, start: datetime | None = None,
         envelope["prometheus"] = {"available": False, "url": prom.url()}
         return envelope
 
+    src_roles = _source_roles(info.get("template") or {})
     periods = []
     for i in range(count):
         p_start = start_dt + timedelta(seconds=i * chunk_s)
         p_end = p_start + timedelta(seconds=chunk_s)
         stats = _interval_stats(name, roles, wanted, chunk_s,
-                                p_end.timestamp())
+                                p_end.timestamp(), src_roles)
         periods.append({
             "start": p_start.isoformat(timespec="seconds"),
             "end": p_end.isoformat(timespec="seconds"),

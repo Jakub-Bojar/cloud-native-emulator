@@ -21,6 +21,7 @@ import time
 
 import yaml
 
+import chaos
 import k8s
 
 log = logging.getLogger(__name__)
@@ -536,6 +537,13 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
         else:
             log.warning("Template %s: peer-IP patch on %s failed: %s",
                         name, cm_name, status)
+
+    # ─── Phase 3: refresh Chaos Mesh latency injection ───────────────────
+    # Any pods this materialise created are invisible to existing
+    # NetworkChaos (Chaos Mesh snapshots its pod list at apply time), so
+    # re-resolve it now that the pods exist. No-op when nothing changed or
+    # Chaos Mesh isn't installed; never fails the materialise.
+    chaos.refresh()
 
 
 def _deep_merge(base: dict, patch: dict) -> dict:

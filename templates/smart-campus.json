@@ -1,0 +1,23 @@
+{
+  "name": "smart-campus",
+  "x": 40,
+  "roles": {
+    "cameras":     { "count": 2, "tier": "edge",  "cpu": { "a": 1,   "b": 80 },  "ram": { "a": 0.5,  "b": 64 },  "net": { "a": 0.2,  "b": 4 } },
+    "iot-sensors": { "count": 3, "tier": "edge",  "cpu": { "a": 0.5, "b": 40 },  "ram": { "a": 0.25, "b": 40 },  "net": { "a": 0.1,  "b": 2 } },
+    "mobile-apps": { "count": 2, "tier": "fog",   "cpu": { "a": 1,   "b": 50 },  "ram": { "a": 0.5,  "b": 56 },  "net": { "a": 0.15, "b": 3 } },
+    "aggregator":  { "count": 2, "tier": "fog",   "cpu": { "a": 2,   "b": 60 },  "ram": { "a": 1,    "b": 96 },  "net": { "a": 0.25, "b": 2 } },
+    "api":         { "count": 2, "tier": "fog",   "cpu": { "a": 2.5, "b": 70 },  "ram": { "a": 1.5,  "b": 110 }, "net": { "a": 0.2,  "b": 2 } },
+    "analytics":   { "count": 2, "tier": "cloud", "cpu": { "a": 4,   "b": 100 }, "ram": { "a": 2,    "b": 160 }, "net": { "a": 0.1,  "b": 1 } },
+    "storage":     { "count": 1, "tier": "cloud", "cpu": { "a": 2,   "b": 80 },  "ram": { "a": 4,    "b": 256 }, "net": { "a": 0,    "b": 0 } }
+  },
+  "edges": [
+    { "from": "cameras",     "to": "aggregator" },
+    { "from": "iot-sensors", "to": "aggregator" },
+    { "from": "mobile-apps", "to": "api" },
+    { "from": "aggregator",  "to": "analytics" },
+    { "from": "api",         "to": "analytics" },
+    { "from": "api",         "to": "storage" },
+    { "from": "analytics",   "to": "storage" },
+    { "from": "cameras",     "to": "storage" }
+  ]
+}

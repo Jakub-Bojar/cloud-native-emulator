@@ -52,6 +52,16 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "create", "update", "patch", "delete", "deletecollection"]
+  # Chaos Mesh latency injection. materialise() refreshes NetworkChaos after
+  # creating pods so the latency covers them — via the pause/resume
+  # annotation (see controller/chaos.py). Chaos Mesh's own admission webhook
+  # (vauth) gates RESUMING an experiment on the requester holding broad
+  # chaos-mesh.org permissions in the target namespace — a single-resource
+  # grant is rejected with "forbidden on namespace", hence resources: ["*"].
+  # Namespace-scoped, and harmless if Chaos Mesh isn't installed.
+  - apiGroups: ["chaos-mesh.org"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

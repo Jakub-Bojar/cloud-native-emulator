@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY controller/app.py          /app/app.py
 COPY controller/api.py          /app/api.py
+COPY controller/chaos.py        /app/chaos.py
 COPY controller/graph.py        /app/graph.py
 COPY controller/k8s.py          /app/k8s.py
 COPY controller/materialiser.py /app/materialiser.py

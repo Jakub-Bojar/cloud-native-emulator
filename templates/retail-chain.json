@@ -1,0 +1,18 @@
+{
+  "name": "retail-chain",
+  "x": 30,
+  "roles": {
+    "pos":          { "count": 3, "tier": "edge",  "cpu": { "a": 1.5, "b": 50 },  "ram": { "a": 0.5, "b": 40 },  "net": { "a": 0.2,  "b": 2 } },
+    "shelf-cams":   { "count": 2, "tier": "edge",  "cpu": { "a": 2,   "b": 70 },  "ram": { "a": 1,   "b": 64 },  "net": { "a": 0.3,  "b": 3 } },
+    "store-server": { "count": 2, "tier": "fog",   "cpu": { "a": 2.5, "b": 80 },  "ram": { "a": 1.5, "b": 128 }, "net": { "a": 0.25, "b": 3 } },
+    "inventory":    { "count": 1, "tier": "cloud", "cpu": { "a": 3,   "b": 90 },  "ram": { "a": 2,   "b": 192 }, "net": { "a": 0,    "b": 0 } },
+    "backup":       { "count": 1, "tier": "cloud", "cpu": { "a": 1,   "b": 60 },  "ram": { "a": 3,   "b": 256 }, "net": { "a": 0,    "b": 0 } }
+  },
+  "edges": [
+    { "from": "pos",          "to": "store-server" },
+    { "from": "shelf-cams",   "to": "store-server" },
+    { "from": "store-server", "to": "inventory" },
+    { "from": "store-server", "to": "backup" },
+    { "from": "pos",          "to": "backup" }
+  ]
+}
