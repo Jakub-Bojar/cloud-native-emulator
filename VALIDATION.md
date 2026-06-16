@@ -90,7 +90,7 @@ echo "GET http://192.168.2.2:30090/" | vegeta attack -rate=100 -duration=180s | 
 Note vegeta's **achieved** rate from the report — use *that* as `x` (if the app
 can't keep up, that's its saturation point). While it's in steady state, run
 these in **Grafana → Explore** (Prometheus datasource), pointed at the app's
-pods — the same windowed-average pattern the `/summary` endpoint uses:
+pods — the same windowed-average pattern the `/measurements/range` endpoint uses:
 
 ```promql
 # CPU (millicores)
@@ -142,7 +142,7 @@ add a tiny `sink` role + an edge so the app role actually emits its `net`.
 ```
 
 ```bash
-curl -X POST http://192.168.2.2:30081/templates \
+curl -X POST http://192.168.2.2:30081/template \
   -H 'Content-Type: application/json' -d @emu-target.json
 ```
 
@@ -154,7 +154,9 @@ Wait ~2 min for the emulator to settle, then read the `app` role back with the
 same windowing:
 
 ```bash
-curl -s "http://192.168.2.2:30081/api/v1/templates/emu-target/summary?range=2m&by_role=true&include_x=true" \
+# end defaults to now; start = end - 2m. The per-role breakdown and the
+# x block (split into input/derived) are always included.
+curl -s "http://192.168.2.2:30081/measurements/range?start=$(date -u -v-2M +%Y-%m-%dT%H:%M:%S)" \
   | python3 -m json.tool
 ```
 
@@ -167,7 +169,7 @@ levels to confirm it holds across the range, not just one point.
 Swap the `image:` in `target.yaml` and the URL/path in the vegeta line —
 **everything else is identical**. That sameness *is* the universal method:
 always `x` = achieved RPS, always cgroup/cAdvisor metrics, always least-squares
-fit, always compare with the same `/summary`-style window.
+fit, always compare with the same `/measurements/range`-style window.
 
 ---
 
@@ -176,8 +178,9 @@ fit, always compare with the same `/summary`-style window.
 - **The emulator has a per-pod resource floor — the target must exceed it.**
   Each worker pod consumes resources just to exist: the Python process plus its
   iperf3 server pool sit at roughly **~4 mc CPU and ~18 MB RAM** when idle
-  (read the floor off a zero-load role — e.g. a `sink` — in `/summary`'s
-  `actual_avg`). The emulator therefore **cannot reproduce a target lighter
+  (read the floor off a zero-load role — e.g. a `sink` — in
+  `/measurements/range`'s `actual_avg`). The emulator therefore **cannot
+  reproduce a target lighter
   than this floor**, and RAM is the hard wall: a target using *less* RAM than
   the worker needs to run (e.g. idle `nginx` at ~13 MB) is physically
   impossible to emulate, no matter how good the fit. Validate against a target

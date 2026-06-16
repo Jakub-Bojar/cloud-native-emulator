@@ -30,8 +30,11 @@ the template itself.
 
 import json
 import logging
+import re
 import time
 from urllib.parse import quote
+
+from prometheus_client import Gauge
 
 import k8s
 
@@ -57,22 +60,35 @@ def _chaos_path(name: str | None = None) -> str:
     return f"{base}/{name}" if name else base
 
 
-def _live_worker_pods() -> tuple[set[str], bool] | None:
-    """(running worker pod names, any_churning) or None on API error."""
+def _live_worker_pods() -> tuple[dict[str, str], bool] | None:
+    """({running worker pod name: node name}, any_churning) or None on API
+    error."""
     path = (f"/api/v1/namespaces/{k8s.namespace()}/pods"
             f"?labelSelector={quote(WORKER_SELECTOR)}")
     status, body = k8s.get(path)
     if status != 200:
         return None
-    running: set[str] = set()
+    running: dict[str, str] = {}
     churning = False
     for pod in json.loads(body).get("items", []):
         meta, st = pod.get("metadata", {}), pod.get("status", {})
         if meta.get("deletionTimestamp") or st.get("phase") == "Pending":
             churning = True
         elif st.get("phase") == "Running":
-            running.add(meta.get("name", ""))
+            running[meta.get("name", "")] = pod.get("spec", {}).get("nodeName", "")
     return running, churning
+
+
+def _workers_stable(timeout_s: float = STABLE_TIMEOUT_S) -> bool:
+    """Wait until no worker pod is Pending/Terminating. Touching the chaos
+    mid-churn either bakes in a stale pod list or races the chaos-daemon."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        live = _live_worker_pods()
+        if live is not None and not live[1]:
+            return True
+        time.sleep(3)
+    return False
 
 
 def refresh() -> None:
@@ -119,22 +135,13 @@ def _refresh() -> None:
     if live is None:
         log.warning("chaos refresh: cannot list worker pods; skipping")
         return
-    live_pods, _ = live
+    live_pods = set(live[0])
     if recorded == live_pods:
         log.info("chaos refresh: records match the %d live worker pods — "
                  "nothing to do", len(live_pods))
         return
 
-    # Wait for the pod set to stop churning; a refresh mid-churn would just
-    # be stale again (and racing the chaos-daemon is what corrupts the
-    # merged tc rules).
-    deadline = time.monotonic() + STABLE_TIMEOUT_S
-    while time.monotonic() < deadline:
-        live = _live_worker_pods()
-        if live is not None and not live[1]:
-            break
-        time.sleep(3)
-    else:
+    if not _workers_stable():
         log.warning("chaos refresh: worker pods still churning after %ss; "
                     "skipping (next materialise will retry)", STABLE_TIMEOUT_S)
         return
@@ -250,13 +257,293 @@ def _wait(cond, timeout_s: float) -> bool:
     return False
 
 
+def _item_injected(item: dict) -> bool:
+    """True only when an AllInjected=True condition is PRESENT. A freshly
+    created NetworkChaos has no conditions at all — treating that as success
+    (vacuous all()) made the controller report injection prematurely."""
+    return any(c.get("type") == "AllInjected" and c.get("status") == "True"
+               for c in item.get("status", {}).get("conditions", []))
+
+
 def _all_injected() -> bool:
     status, body = k8s.get(_chaos_path())
     if status != 200:
         return False
     items = json.loads(body).get("items", [])
-    return bool(items) and all(
-        c.get("status") == "True"
-        for item in items
-        for c in item.get("status", {}).get("conditions", [])
-        if c.get("type") == "AllInjected")
+    return bool(items) and all(_item_injected(i) for i in items)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Template-defined latency: the template's optional `latency` field declares
+# RTTs between tier pairs, e.g.
+#
+#     "latency": { "edge": { "fog": "30ms", "cloud": "120ms" },
+#                  "fog":  { "cloud": "60ms" } }
+#
+# The controller renders one NetworkChaos per pair (selector = pods on nodes
+# of one tier, target = the other, direction both, delay = HALF the RTT so
+# the two ends sum to it), labels them as controller-managed, and reconciles
+# them on every materialise: spec drift or a stale pod list → replace; in
+# sync → untouched, so a numbers-only PATCH never blips the latency. The
+# desired state is always derivable from the template, so no snapshot is
+# needed: an interrupted replace is simply completed by the next materialise.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MANAGED_LABEL = "app.kubernetes.io/managed-by"
+MANAGED_VALUE = "emulator-controller"
+
+_RTT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(us|ms|s)\s*$")
+_UNIT_US = {"us": 1, "ms": 1_000, "s": 1_000_000}
+_MAX_RTT_US = 10 * 1_000_000  # 10s — beyond any plausible WAN emulation
+
+# The template's CONFIGURED inter-tier RTTs, exposed on the controller's
+# /metrics so dashboards can show "what the latency is meant to be" alongside
+# the workers' measured worker_peer_rtt_ms. Latency is symmetric, so it's one
+# series per UNORDERED tier pair (label `pair`, e.g. "edge ↔ cloud").
+# Recomputed each scrape from the live template, so a PATCH retune shows up
+# immediately.
+CONFIGURED_RTT = Gauge(
+    "emulator_configured_rtt_ms",
+    "Configured inter-tier round-trip latency (ms) from the template's "
+    "latency field, one series per unordered tier pair. Compare against "
+    "measured worker_peer_rtt_ms.",
+    ["pair"])
+
+
+def set_configured_rtt(pairs: dict[tuple[str, str], int]) -> None:
+    """Publish `pairs` ({(tierA,tierB): rtt_us} from validate_latency) as the
+    CONFIGURED_RTT gauge. Each key is already a sorted (min,max) tuple, so the
+    `pair` label is deterministic. Cleared first so a retune or teardown drops
+    stale series."""
+    CONFIGURED_RTT.clear()
+    for (a, b), rtt_us in pairs.items():
+        CONFIGURED_RTT.labels(pair=f"{a} ↔ {b}").set(rtt_us / 1000.0)
+
+
+def _parse_rtt_us(value) -> int:
+    if not isinstance(value, str) or not _RTT_RE.match(value):
+        raise ValueError(f"latency value {value!r}: use a duration like "
+                         "'10ms', '120ms', '1s'")
+    m = _RTT_RE.match(value)
+    us = int(float(m.group(1)) * _UNIT_US[m.group(2)])
+    if us < 2:
+        raise ValueError(f"latency {value!r} is below 1us per direction")
+    if us > _MAX_RTT_US:
+        raise ValueError(f"latency {value!r} exceeds the 10s cap")
+    return us
+
+
+def validate_latency(latency) -> dict[tuple[str, str], int]:
+    """template.latency → {(tierA, tierB) sorted: rtt_us}.
+
+    Raises ValueError on bad shape, bad durations, same-tier pairs, or a
+    pair specified twice (latency is symmetric — give each pair once,
+    in either orientation)."""
+    if latency is None:
+        return {}
+    if not isinstance(latency, dict):
+        raise ValueError(
+            'latency must be an object: {"tier": {"peerTier": "rtt"}}')
+    pairs: dict[tuple[str, str], int] = {}
+    for a, peers in latency.items():
+        if not isinstance(a, str) or not a:
+            raise ValueError("latency keys must be tier names")
+        if not isinstance(peers, dict):
+            raise ValueError(f"latency.{a} must be an object of peer tiers")
+        for b, rtt in peers.items():
+            if not isinstance(b, str) or not b:
+                raise ValueError(f"latency.{a} keys must be tier names")
+            if a == b:
+                raise ValueError(
+                    f"latency.{a}.{b}: same-tier latency is not supported")
+            key = (min(a, b), max(a, b))
+            if key in pairs:
+                raise ValueError(
+                    f"latency between {key[0]} and {key[1]} is specified "
+                    "more than once (it is symmetric — give each pair once)")
+            pairs[key] = _parse_rtt_us(rtt)
+    return pairs
+
+
+def _latency_specs(pairs: dict[tuple[str, str], int]) -> list[dict]:
+    ns = k8s.namespace()
+    specs = []
+    for (a, b), rtt_us in sorted(pairs.items()):
+        each_way_us = max(1, rtt_us // 2)
+        specs.append({
+            "apiVersion": "chaos-mesh.org/v1alpha1",
+            "kind": "NetworkChaos",
+            "metadata": {
+                "name": f"wt-latency-{a}-{b}",
+                "namespace": ns,
+                "labels": {MANAGED_LABEL: MANAGED_VALUE},
+            },
+            "spec": {
+                "action": "delay",
+                "mode": "all",
+                "selector": {"namespaces": [ns],
+                             "nodeSelectors": {"tier": a}},
+                "target": {"mode": "all",
+                           "selector": {"namespaces": [ns],
+                                        "nodeSelectors": {"tier": b}}},
+                "direction": "both",
+                "delay": {"latency": f"{each_way_us}us"},
+            },
+        })
+    return specs
+
+
+def _sig(item: dict) -> tuple:
+    """The fields we own, for drift detection. Never compare full specs —
+    the API server adds defaults that would read as permanent drift."""
+    spec = item.get("spec", {})
+    return (
+        item.get("metadata", {}).get("name"),
+        spec.get("action"),
+        spec.get("direction"),
+        (spec.get("delay") or {}).get("latency"),
+        (spec.get("selector") or {}).get("nodeSelectors", {}).get("tier"),
+        ((spec.get("target") or {}).get("selector") or {})
+        .get("nodeSelectors", {}).get("tier"),
+    )
+
+
+def _records(item: dict) -> set[str]:
+    return {r.get("id", "").split("/")[-1]
+            for r in ((item.get("status", {}).get("experiment", {}) or {})
+                      .get("containerRecords") or [])}
+
+
+def _node_tiers() -> dict[str, str]:
+    status, body = k8s.get("/api/v1/nodes")
+    if status != 200:
+        return {}
+    return {n["metadata"]["name"]: n["metadata"].get("labels", {}).get("tier")
+            for n in json.loads(body).get("items", [])
+            if n["metadata"].get("labels", {}).get("tier")}
+
+
+def _managed_stale(mine: list[dict]) -> bool:
+    """True when any managed NetworkChaos's records diverge from the running
+    worker pods on the tiers it covers (pod churn since injection)."""
+    live = _live_worker_pods()
+    if live is None:
+        return False  # can't tell — don't churn the chaos on a blind guess
+    pod_node, _ = live
+    tiers = _node_tiers()
+    pod_tier = {p: tiers.get(n) for p, n in pod_node.items()}
+    for item in mine:
+        sig = _sig(item)
+        a, b = sig[4], sig[5]
+        expected = {p for p, t in pod_tier.items() if t in (a, b)}
+        if expected != _records(item):
+            return True
+    return False
+
+
+def _managed_items() -> list[dict]:
+    status, body = k8s.get(_chaos_path())
+    if status != 200:
+        return [{}]  # unknown — read as "still there" so waiters keep waiting
+    return [i for i in json.loads(body).get("items", [])
+            if (i.get("metadata", {}).get("labels") or {})
+            .get(MANAGED_LABEL) == MANAGED_VALUE]
+
+
+def apply_template_latency(template: dict) -> None:
+    """Reconcile the controller-managed NetworkChaos with the template's
+    `latency` field. Never raises — latency is auxiliary."""
+    try:
+        _apply_template_latency(template)
+    except Exception:
+        log.exception("chaos latency: apply failed; continuing")
+
+
+def _apply_template_latency(template: dict) -> None:
+    pairs = validate_latency(template.get("latency"))
+    status, body = k8s.get(_chaos_path())
+    if status == 404:
+        if pairs:
+            log.warning("chaos latency: template defines latency but Chaos "
+                        "Mesh is not installed — skipping")
+        return
+    if status != 200:
+        log.warning("chaos latency: list returned %s; skipping", status)
+        return
+    items = json.loads(body).get("items", [])
+    mine = [i for i in items
+            if (i.get("metadata", {}).get("labels") or {})
+            .get(MANAGED_LABEL) == MANAGED_VALUE]
+    others = [i["metadata"]["name"] for i in items if i not in mine]
+    if pairs and others:
+        log.warning("chaos latency: unmanaged NetworkChaos %s exist alongside "
+                    "the template-defined latency — delays may stack; remove "
+                    "them (e.g. kubectl delete -f manifests/network-chaos.yaml)",
+                    others)
+
+    desired = _latency_specs(pairs)
+    in_sync = ({_sig(i) for i in mine} == {_sig(d) for d in desired})
+    if in_sync and not (mine and _managed_stale(mine)):
+        if mine:
+            log.info("chaos latency: %d template-defined NetworkChaos in "
+                     "sync — nothing to do", len(mine))
+        return
+
+    if not _workers_stable():
+        log.warning("chaos latency: worker pods still churning after %ss; "
+                    "skipping (next materialise will retry)", STABLE_TIMEOUT_S)
+        return
+
+    if mine:
+        log.info("chaos latency: replacing %d managed NetworkChaos",
+                 len(mine))
+        for item in mine:
+            k8s.delete(_chaos_path(item["metadata"]["name"]))
+        if not _wait(lambda: not _managed_items(), DELETE_TIMEOUT_S):
+            log.warning("chaos latency: old managed NetworkChaos still "
+                        "terminating after %ss — the next materialise will "
+                        "finish the replacement", DELETE_TIMEOUT_S)
+            return
+    if not desired:
+        log.info("chaos latency: template defines no latency — managed "
+                 "NetworkChaos removed")
+        return
+
+    for spec in desired:
+        name = spec["metadata"]["name"]
+        for attempt in range(3):
+            status, resp = k8s.post(_chaos_path(), spec)
+            if status in (200, 201, 409):
+                break
+            log.warning("chaos latency: create %s failed (try %d/3): %s %s",
+                        name, attempt + 1, status, resp[:200])
+            time.sleep(2)
+    def _managed_injected() -> bool:
+        mine_now = _managed_items()
+        return (bool(mine_now) and mine_now != [{}]
+                and all(_item_injected(i) for i in mine_now))
+
+    if _wait(_managed_injected, INJECT_TIMEOUT_S):
+        log.info("chaos latency: %d NetworkChaos applied from the template "
+                 "and injected", len(desired))
+    else:
+        log.warning("chaos latency: not AllInjected after %ss — check "
+                    "worker_peer_rtt_ms / kubectl describe networkchaos",
+                    INJECT_TIMEOUT_S)
+
+
+def delete_managed() -> int:
+    """Remove the template-defined NetworkChaos. Called FIRST in teardown,
+    while the worker pods are still alive — recovering rules from live pods
+    is fast, whereas records pointing at dead pods stall the finalizers."""
+    try:
+        mine = _managed_items()
+        if mine == [{}] or not mine:
+            return 0
+        for item in mine:
+            k8s.delete(_chaos_path(item["metadata"]["name"]))
+        log.info("chaos latency: deleted %d managed NetworkChaos", len(mine))
+        return len(mine)
+    except Exception:
+        log.exception("chaos latency: delete failed; continuing")
+        return 0

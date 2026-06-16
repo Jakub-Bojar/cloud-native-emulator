@@ -9,9 +9,10 @@ Service per role and runs synthetic CPU, RAM, and network load in every pod
 sized to per-role formulas. A single input signal `x` propagates through the
 role graph, so changing one number recasts load across the whole topology.
 
-Each controller is the **site API for one VM**. Every `/api/v1` response is
-tagged with a `{site}` block (edge / fog / cloud), so the same system can be
-run on multiple VMs and merged by a federation layer later.
+Each controller is the **site API for one VM** and manages exactly one
+template. Every observability response is tagged with a `{site}` block
+(edge / fog / cloud), so the same system can be run on multiple VMs and
+merged by a federation layer later.
 
 ## How it works
 
@@ -25,14 +26,19 @@ run on multiple VMs and merged by a federation layer later.
   (RAM, with a feedback nudger), and `iperf3` (per-peer network traffic).
 - **Two-phase materialisation** — pods are created first, then their real
   IPs are resolved and written back so iperf3 clients target concrete peers.
+- **Inter-tier latency** — an optional `latency` field declares RTTs between
+  tiers (e.g. `"edge": {"cloud": "100ms"}`); the controller renders and
+  reconciles Chaos Mesh `NetworkChaos` from it, re-resolving automatically
+  when pods churn, and tears it down with the template.
 - **Observability** — workers export Prometheus gauges (target vs actual per
-  resource); the controller fuses k8s state + live scrapes + Prometheus into
-  the `/api/v1` endpoints, and serves a Grafana node-graph of measured edges.
+  resource, plus per-peer RTT); the controller fuses k8s state + live scrapes
+  + Prometheus into the measurement endpoints, and serves a Grafana
+  node-graph of measured edges.
 
 ```
-                POST /templates {x, roles, edges}
+          POST /template {x, roles, edges, latency}
    operator ─────────────────────────────────▶ ┌──────────────┐
-   GET /api/v1/... (observe / scale)            │ controller   │ NodePort 30081
+   GET /overview · /measurements/* · /graph     │ controller   │ NodePort 30081
                                                 │ materialiser │
                                                 └──────┬───────┘
                               create/patch via k8s API │
@@ -41,7 +47,7 @@ run on multiple VMs and merged by a federation layer later.
          Deployment+CM+Svc        Deployment+CM+Svc            Deployment+CM+Svc
           (role: gateway)          (role: api ×N)                 (role: db)
               worker pods  ◀── iperf3 peer traffic ──▶  worker pods
-                 │ /metrics scrape
+                 │ /metrics scrape    (Chaos Mesh injects inter-tier latency)
                  ▼
           Prometheus ──▶ Grafana
 ```
@@ -52,7 +58,7 @@ run on multiple VMs and merged by a federation layer later.
 |-----|--------------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System diagrams, the x-propagation model, two-phase materialisation, federation roadmap |
 | [API.md](API.md) | Full HTTP API reference with worked examples |
-| [openapi.yaml](openapi.yaml) | Machine-readable OpenAPI 3.0 spec (load into Swagger UI / generate clients) |
+| `GET /docs`, `GET /openapi.json` | Live Swagger UI (dark) + generated OpenAPI spec — always matches the running code |
 | [RUNBOOK.md](RUNBOOK.md) | Build, deploy, drive, observe, debug, tear down |
 
 ## Prerequisites
@@ -60,7 +66,12 @@ run on multiple VMs and merged by a federation layer later.
 - Docker + a Docker Hub account (examples use `jp36/…` — swap in your own)
 - MicroK8s on a reachable host, with `metrics-server` enabled
 - Optional: a Prometheus Operator install (kube-prometheus-stack) for the
-  PodMonitor and the windowed `/summary` endpoint
+  PodMonitor and the windowed measurement endpoints
+- Optional: Chaos Mesh for inter-tier latency (the template's `latency`
+  field). On MicroK8s install it with the containerd socket override:
+  `helm install chaos-mesh chaos-mesh/chaos-mesh -n chaos-mesh
+  --create-namespace --set chaosDaemon.runtime=containerd
+  --set chaosDaemon.socketPath=/var/snap/microk8s/common/run/containerd.sock`
 
 ## Quick start
 
@@ -79,8 +90,8 @@ docker push jp36/emulator-controller:latest
 microk8s kubectl apply -f manifests/controller.yaml
 microk8s kubectl apply -f manifests/monitoring.yaml
 
-# 3. Materialise a topology.
-curl -X POST http://192.168.2.2:30081/templates \
+# 3. Materialise a topology (one controller manages one template).
+curl -X POST http://192.168.2.2:30081/template \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "fb",
@@ -93,16 +104,16 @@ curl -X POST http://192.168.2.2:30081/templates \
   }'
 
 # 4. Observe.
-curl -s http://192.168.2.2:30081/api/v1/overview | python3 -m json.tool
-curl -s http://192.168.2.2:30081/api/v1/templates/fb/status | python3 -m json.tool
-curl -s "http://192.168.2.2:30081/api/v1/templates/fb/summary?range=15m&by_role=true" | python3 -m json.tool
+curl -s http://192.168.2.2:30081/overview | python3 -m json.tool
+curl -s http://192.168.2.2:30081/measurements/now | python3 -m json.tool
+curl -s "http://192.168.2.2:30081/measurements/range?resources=cpu,ram,net" | python3 -m json.tool
 
-# 5. Scale a role (re-resolves x + re-wires peers).
-curl -X POST http://192.168.2.2:30081/api/v1/templates/fb/roles/backend/scale \
-  -H 'Content-Type: application/json' -d '{"replicas": 4}'
+# 5. Scale a role (re-resolves x + re-wires peers) via PATCH.
+curl -X PATCH http://192.168.2.2:30081/template \
+  -H 'Content-Type: application/json' -d '{"roles.backend.count": 4}'
 
 # 6. Tear down.
-curl -X DELETE http://192.168.2.2:30081/templates/fb
+curl -X DELETE http://192.168.2.2:30081/template
 ```
 
 You can also drive it declaratively — `kubectl apply` a ConfigMap labelled
@@ -114,11 +125,14 @@ it. See [RUNBOOK.md](RUNBOOK.md).
 ```
 cloud-native-emulator/
 ├── README.md
-├── ARCHITECTURE.md · API.md · RUNBOOK.md · openapi.yaml
+├── ARCHITECTURE.md · API.md · RUNBOOK.md · VALIDATION.md
+│       (openapi.yaml is a hand-maintained spec that may lag — prefer GET /openapi.json)
 ├── controller/
 │   ├── Dockerfile
-│   ├── app.py            FastAPI HTTP routes: /templates CRUD + /graph + /api/v1
-│   ├── api.py            unified /api/v1 site API (query + scale)
+│   ├── app.py            FastAPI HTTP routes: /template CRUD + /graph + measurements
+│   ├── api.py            observability endpoints (overview / measurements)
+│   ├── chaos.py          Chaos Mesh integration: template-defined inter-tier
+│   │                     latency + automatic re-resolution after pod churn
 │   ├── prom.py           Prometheus HTTP API client
 │   ├── graph.py          topology scrape + edge measurement
 │   ├── materialiser.py   template → k8s resources, two-phase create + IP resolve
@@ -131,9 +145,13 @@ cloud-native-emulator/
 │   ├── metrics.py        cgroup sampler, Prometheus gauges, RAM nudger
 │   ├── state.py          shared state + tunable env constants
 │   └── watcher.py        filesystem watchdog on the mounted ConfigMap
-└── manifests/
-    ├── controller.yaml          ServiceAccount + RBAC + Pod + NodePort Service
-    ├── worker-template.yaml      per-role blueprint, baked into the controller image
-    ├── monitoring.yaml           PodMonitor for the templated worker pods
-    └── grafana-dashboard.json    dashboards
+├── manifests/
+│   ├── controller.yaml          ServiceAccount + RBAC + Pod + NodePort Service
+│   ├── worker-template.yaml      per-role blueprint, baked into the controller image
+│   ├── network-chaos.yaml        hand-applied inter-tier latency (legacy — prefer
+│   │                             the template's `latency` field)
+│   └── monitoring.yaml           PodMonitor for the templated worker pods
+├── templates/                    ready-made topologies (iot-pipeline, smart-campus,
+│                                 retail-chain — the latter shows the latency field)
+└── grafana/                      dashboards incl. grafana-rtt.json (per-link RTT)
 ```

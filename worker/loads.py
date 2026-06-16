@@ -33,6 +33,8 @@ import threading
 import time
 
 from state import (CPU_LOAD_SLICE_MS, IPERF_BASE_PORT, IPERF_PORT_COUNT,
+                   IPERF_SERVER_RECYCLE_INTERVAL_S,
+                   IPERF_SERVER_RECYCLE_GRACE_S,
                    PAGE_SIZE, STATE, STATE_LOCK,
                    PEER_EGRESS_MBPS, PEER_EGRESS_LOCK)
 
@@ -40,6 +42,15 @@ log = logging.getLogger(__name__)
 
 PROCS: list[subprocess.Popen] = []
 RAM_BUFFER: mmap.mmap | None = None
+
+# The iperf3 server pool, keyed by listen port, so the recycler thread can
+# kill+respawn a single poisoned server without disturbing the others. Each
+# server here is also in PROCS, so stop_current() still tears the pool down on
+# a full reconfigure. Guarded by a lock because the recycler thread, a
+# configure() reconfigure, and stop_current() can all touch it concurrently.
+IPERF_SERVERS: dict[int, subprocess.Popen] = {}
+IPERF_SERVERS_LOCK = threading.Lock()
+_RECYCLER_STARTED = False
 
 # The stress-ng process(es) currently generating CPU load. Tracked separately
 # from PROCS (which also holds iperf3 servers) so the CPU feedback loop can
@@ -65,6 +76,19 @@ CPU_STRESS_CMD: object = _CMD_UNSET
 # (which is reserved for processes whose lifetime is bounded by a single
 # start_*/stop_current cycle).
 PEER_SUPS: list[tuple[threading.Thread, threading.Event]] = []
+
+# The iperf3 child each peer supervisor currently owns. A supervisor blocked
+# reading a HUNG iperf3's stdout (common during a network blip — e.g. a
+# flapping control plane) only checks its stop event per output line, so it
+# can't react while no lines arrive. On reconfigure, stop_current() kills
+# these children directly: that both unblocks the read (EOF) so the thread
+# exits AND guarantees no client survives to double up with the next
+# configure's client — a survivor would keep sending to its peer, so that
+# peer would receive ~2x its budget and the role's egress would never settle.
+# Guarded by a lock: supervisors register/deregister here while the stop path
+# snapshots it.
+PEER_CHILDREN: set[subprocess.Popen] = set()
+PEER_CHILDREN_LOCK = threading.Lock()
 
 
 def spawn(cmd: list[str]) -> subprocess.Popen:
@@ -256,6 +280,8 @@ def _peer_client_supervisor(peer: str, mbps_per_peer: float,
         except FileNotFoundError:
             log.error("iperf3 binary not found — peer supervisor exiting")
             return
+        with PEER_CHILDREN_LOCK:
+            PEER_CHILDREN.add(proc)
         # Drain stdout line-by-line. This both yields live throughput AND
         # avoids the page-cache drift a log file would cause — the bytes are
         # consumed, not buffered. iperf3 emits a line every second, so the
@@ -280,11 +306,123 @@ def _peer_client_supervisor(peer: str, mbps_per_peer: float,
                 proc.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        with PEER_CHILDREN_LOCK:
+            PEER_CHILDREN.discard(proc)
         if stop.is_set():
             return
         # iperf3 client exited on its own (peer unreachable / 24h reached).
         # Back off briefly before retrying so a missing peer doesn't pin a CPU.
         stop.wait(2.0)
+
+
+# ── iperf3 server pool + self-recycling ──────────────────────────────────────
+
+def _spawn_server(port: int) -> None:
+    """Start one iperf3 server on `port` and register it for recycling."""
+    p = spawn(["iperf3", "-s", "-p", str(port)])
+    with IPERF_SERVERS_LOCK:
+        IPERF_SERVERS[port] = p
+
+
+def _established_local_ports() -> set[int]:
+    """Local ports with at least one ESTABLISHED inbound TCP connection.
+
+    Read straight from the kernel (/proc/net/tcp{,6}) so it needs no extra
+    binary in the image. State 01 == TCP_ESTABLISHED; the local port is the
+    hex field after the ':' in column 2."""
+    ports: set[int] = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                next(f, None)  # skip header
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 4 or parts[3] != "01":
+                        continue
+                    try:
+                        ports.add(int(parts[1].rsplit(":", 1)[1], 16))
+                    except (IndexError, ValueError):
+                        continue
+        except OSError:
+            continue
+    return ports
+
+
+def _recycle_server_locked(port: int) -> None:
+    """Kill and respawn the server on `port`. Caller holds IPERF_SERVERS_LOCK.
+
+    There is no live connection when this runs (that's the recycle condition),
+    so no active test is disrupted."""
+    old = IPERF_SERVERS.get(port)
+    if old is not None:
+        if old.poll() is None:
+            old.send_signal(signal.SIGTERM)
+            try:
+                old.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                old.kill()
+        if old in PROCS:
+            PROCS.remove(old)
+    p = spawn(["iperf3", "-s", "-p", str(port)])
+    IPERF_SERVERS[port] = p
+
+
+def _server_recycler() -> None:
+    """Daemon: free poisoned iperf3 server ports (see state.py for the why).
+
+    Per port we track whether a connection was ever seen and when it was last
+    seen. A port that HAD a connection but has been connection-less for
+    RECYCLE_GRACE_S is recycled; a port with a live connection or one that has
+    never had a client is left untouched, so a healthy pool never churns."""
+    last_seen: dict[int, float] = {}
+    seen_conn: set[int] = set()
+    while True:
+        time.sleep(IPERF_SERVER_RECYCLE_INTERVAL_S)
+        try:
+            est = _established_local_ports()
+            now = time.monotonic()
+            with IPERF_SERVERS_LOCK:
+                for port, proc in list(IPERF_SERVERS.items()):
+                    if proc.poll() is not None:
+                        # Died (crash, or a failed rebind after a recycle) —
+                        # bring it straight back.
+                        log.warning("net: iperf3 server on :%d exited — "
+                                    "respawning", port)
+                        _recycle_server_locked(port)
+                        last_seen.pop(port, None)
+                        seen_conn.discard(port)
+                    elif port in est:
+                        last_seen[port] = now
+                        seen_conn.add(port)
+                    elif (port in seen_conn
+                          and now - last_seen.get(port, now)
+                          >= IPERF_SERVER_RECYCLE_GRACE_S):
+                        log.info("net: recycling stuck iperf3 server on :%d "
+                                 "(connection-less %.0fs after a client "
+                                 "left)", port,
+                                 now - last_seen.get(port, now))
+                        _recycle_server_locked(port)
+                        last_seen.pop(port, None)
+                        seen_conn.discard(port)
+                # Forget state for ports no longer in the pool.
+                for p in [p for p in last_seen if p not in IPERF_SERVERS]:
+                    last_seen.pop(p, None)
+                    seen_conn.discard(p)
+        except Exception:
+            log.exception("server recycler tick failed; continuing")
+
+
+def _ensure_recycler() -> None:
+    """Start the recycler daemon once, lazily (only roles that run servers
+    ever need it)."""
+    global _RECYCLER_STARTED
+    if _RECYCLER_STARTED:
+        return
+    _RECYCLER_STARTED = True
+    threading.Thread(target=_server_recycler, name="iperf-recycler",
+                     daemon=True).start()
+    log.info("net: iperf3 server recycler started (interval=%.0fs grace=%.0fs)",
+             IPERF_SERVER_RECYCLE_INTERVAL_S, IPERF_SERVER_RECYCLE_GRACE_S)
 
 
 def start_network(mbps: float, peers: list[str] | None = None,
@@ -325,8 +463,9 @@ def start_network(mbps: float, peers: list[str] | None = None,
     # (from different source pods in a templated topology), we run
     # `pool_size` servers on consecutive ports.
     for offset in range(pool_size):
-        port = IPERF_BASE_PORT + offset
-        spawn(["iperf3", "-s", "-p", str(port)])
+        _spawn_server(IPERF_BASE_PORT + offset)
+    # Keep poisoned ports from pinning a link at 0 forever (see _server_recycler).
+    _ensure_recycler()
     # Wait until at least the base port is bound; the rest come up
     # within a few ms of that.
     if not _wait_for_port("127.0.0.1", IPERF_BASE_PORT):
@@ -364,23 +503,49 @@ def start_network(mbps: float, peers: list[str] | None = None,
         t.start()
 
 
+def _kill_peer_children() -> None:
+    """SIGKILL every registered peer iperf3 child. Killing the child sends EOF
+    to the supervisor's blocking stdout read, so a supervisor wedged on a hung
+    iperf3 unblocks and can see its stop event."""
+    with PEER_CHILDREN_LOCK:
+        children = list(PEER_CHILDREN)
+    for p in children:
+        if p.poll() is None:
+            p.kill()
+
+
 def _stop_peer_supervisors() -> None:
-    """Signal every peer supervisor to exit and join them."""
+    """Signal every peer supervisor to exit, force-kill their iperf3 children,
+    and join.
+
+    The children must be killed directly (not left to each supervisor): a
+    supervisor only checks its stop event between iperf3 output lines, so one
+    blocked reading a hung client never reacts on its own. Leaving that client
+    alive would let it double up with the next configure's client to the same
+    peer — the over-send + oscillation seen after a reconfigure during network
+    instability. Two kill passes bracket the join to also catch a child a
+    supervisor spawned in the brief window after stop was set."""
     for _, stop in PEER_SUPS:
         stop.set()
+    _kill_peer_children()
     for t, _ in PEER_SUPS:
-        # Each supervisor's inner loop checks `stop` every ~0.5s and then
-        # SIGTERMs its iperf3 child (3s grace, then SIGKILL). Worst case
-        # ~5s per thread; join with a generous timeout per thread.
         t.join(timeout=6.0)
         if t.is_alive():
             log.warning("peer supervisor %s did not exit cleanly", t.name)
+    _kill_peer_children()
+    with PEER_CHILDREN_LOCK:
+        PEER_CHILDREN.clear()
     PEER_SUPS.clear()
 
 
 def stop_current() -> None:
     global RAM_BUFFER, CPU_STRESS_MC, CPU_STRESS_CMD
     _stop_peer_supervisors()
+    # Drop the server-pool registry FIRST so the recycler (which serialises on
+    # IPERF_SERVERS_LOCK) won't respawn a server we're about to kill via PROCS.
+    # The processes themselves are torn down by the PROCS loop below.
+    with IPERF_SERVERS_LOCK:
+        IPERF_SERVERS.clear()
     # Drop stale per-peer egress so a reconfigure with a new peer set doesn't
     # leave dead IPs being republished by the sampler.
     with PEER_EGRESS_LOCK:

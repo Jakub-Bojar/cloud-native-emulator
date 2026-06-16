@@ -96,6 +96,10 @@ def validate(template: dict) -> None:
         if edge.get("to") not in roles:
             raise ValueError(f"edge.to {edge.get('to')!r} not in roles")
 
+    # Optional inter-tier latency declaration; shape and durations are
+    # validated here so a bad field 400s instead of half-materialising.
+    chaos.validate_latency(template.get("latency"))
+
     # Cycle detection.  x is resolved per role by a topological pass over
     # the role graph (see _compute_resolved_x); a cycle would make the
     # system underdetermined, so reject it here so the caller gets a clean
@@ -538,12 +542,17 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
             log.warning("Template %s: peer-IP patch on %s failed: %s",
                         name, cm_name, status)
 
-    # ─── Phase 3: refresh Chaos Mesh latency injection ───────────────────
+    # ─── Phase 3: reconcile Chaos Mesh latency injection ─────────────────
     # Any pods this materialise created are invisible to existing
-    # NetworkChaos (Chaos Mesh snapshots its pod list at apply time), so
-    # re-resolve it now that the pods exist. No-op when nothing changed or
-    # Chaos Mesh isn't installed; never fails the materialise.
-    chaos.refresh()
+    # NetworkChaos (Chaos Mesh snapshots its pod list at apply time). If the
+    # template declares its own `latency`, render/reconcile the managed
+    # NetworkChaos from it; otherwise just re-resolve whatever externally
+    # applied chaos exists. No-op when nothing changed or Chaos Mesh isn't
+    # installed; never fails the materialise.
+    if template.get("latency") is not None:
+        chaos.apply_template_latency(template)
+    else:
+        chaos.refresh()
 
 
 def _deep_merge(base: dict, patch: dict) -> dict:
@@ -639,7 +648,10 @@ def teardown(name: str) -> int:
     """Delete every resource we created for `name`. Returns count deleted."""
     log.info("Tearing down template %s", name)
     selector = f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{TEMPLATE_LABEL}={name}"
-    deleted = 0
+    # Template-defined latency chaos first, while the worker pods are still
+    # alive — Chaos Mesh recovers rules from live pods quickly, but records
+    # pointing at already-deleted pods stall its finalizers.
+    deleted = chaos.delete_managed()
     # Deployments first so pods stop using the ConfigMap before it goes.
     for kind in ("Deployment", "Service", "ConfigMap"):
         path = _kind_path(kind, label_selector=selector)

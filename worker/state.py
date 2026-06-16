@@ -20,6 +20,28 @@ IPERF_BASE_PORT = 9999
 IPERF_PORT_COUNT = int(os.environ.get("IPERF_PORT_COUNT", "8"))
 # Back-compat alias; some callers still want a single canonical port.
 IPERF_PORT = IPERF_BASE_PORT
+
+# --- iperf3 server-pool self-recycling -------------------------------------
+# An iperf3 server (`-s -p PORT`) hosts ONE session at a time. If the client
+# of a session dies uncleanly (SIGKILL during a reconfigure, a pod eviction,
+# a node blip), the server can be left stuck "busy running a test" with no
+# live connection — a poisoned port that refuses every new client. The next
+# client then loops forever on "the server is busy", so that link sits at 0
+# and the role's egress never smooths out.
+#
+# The recycler thread (loads._server_recycler) clears this: every
+# RECYCLE_INTERVAL_S it checks each server port for an ESTABLISHED inbound
+# connection. A port that previously had a connection but has been
+# connection-less for RECYCLE_GRACE_S is treated as poisoned and the server
+# is killed + respawned, freeing the port for the waiting client. A port with
+# a live connection (an active test) is never touched, and a port that has
+# never had a client (idle, peer not up yet) is left alone — so a healthy
+# pool is never churned. GRACE must comfortably exceed a normal client
+# reconnect gap (~2 s) so legitimate reconnects don't trip it.
+IPERF_SERVER_RECYCLE_INTERVAL_S = float(
+    os.environ.get("IPERF_SERVER_RECYCLE_INTERVAL_S", "10"))
+IPERF_SERVER_RECYCLE_GRACE_S = float(
+    os.environ.get("IPERF_SERVER_RECYCLE_GRACE_S", "30"))
 # stress-ng --cpu-load duty-cycle slice (ms). Small values break the busy/idle
 # loading into fine slices, giving the scheduler frequent yield points → much
 # smoother CPU and better load accuracy when several pods share a node. Without

@@ -21,6 +21,10 @@ live in the `cloud-native-emulator` namespace by default — add
 - A Prometheus Operator installation if you want the `PodMonitor` in
   `manifests/monitoring.yaml` to be picked up (otherwise the workers'
   annotations let plain Prometheus scrape them via service discovery)
+- Optional: Chaos Mesh, if you use the template's `latency` field for
+  inter-tier delay. On MicroK8s, install with the containerd socket
+  override (`--set chaosDaemon.runtime=containerd --set
+  chaosDaemon.socketPath=/var/snap/microk8s/common/run/containerd.sock`)
 
 ---
 
@@ -85,7 +89,7 @@ microk8s kubectl rollout restart deployment -l template=<name>
 Or tear down + re-POST the template (clean slate):
 
 ```bash
-curl -X DELETE http://192.168.2.2:30081/templates/<name>
+curl -X DELETE http://192.168.2.2:30081/template
 # re-POST
 ```
 
@@ -93,10 +97,14 @@ curl -X DELETE http://192.168.2.2:30081/templates/<name>
 
 ## Drive the system — two modes
 
-### Mode A: HTTP templates (most flexible)
+### Mode A: HTTP template (most flexible)
+
+A controller manages **one** template, so the routes are singular and take
+no name. POSTing a different name while one exists returns `409` — DELETE
+or PATCH the existing one first.
 
 ```bash
-curl -X POST http://192.168.2.2:30081/templates \
+curl -X POST http://192.168.2.2:30081/template \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "fb",
@@ -108,12 +116,11 @@ curl -X POST http://192.168.2.2:30081/templates \
     "edges": [{"from":"frontend","to":"backend"}]
   }'
 
-# Inspect
-curl -s http://192.168.2.2:30081/templates
-curl -s http://192.168.2.2:30081/templates/fb | python3 -m json.tool
+# Inspect (or load a ready-made one from templates/*.json)
+curl -s http://192.168.2.2:30081/template | python3 -m json.tool
 
 # Tear down
-curl -X DELETE http://192.168.2.2:30081/templates/fb
+curl -X DELETE http://192.168.2.2:30081/template
 ```
 
 The response from POST returns the resolved peer map (Service names) and
@@ -152,50 +159,53 @@ The template's `name` comes from `metadata.name`. Any `name` field inside
 
 ---
 
-## Query & scale via the site API (`/api/v1`)
+## Query & scale via the observability endpoints
 
-The `/api/v1` surface is the one place to *observe everything* and to
-*add/remove pods* — clean JSON, every response tagged with this VM's
-`site` block (`SITE_ID` / `SITE_TIER`). Full schemas in `API.md`; the
-day-to-day commands:
+These are the place to *observe everything* — clean JSON, every response
+tagged with this VM's `site` block (`SITE_ID` / `SITE_TIER`) and a
+generation `timestamp` in the controller's local timezone. Full schemas in
+`API.md`; the day-to-day commands:
 
 ```bash
-# What is running on this VM right now?
-curl -s http://192.168.2.2:30081/api/v1/overview | python3 -m json.tool
+# What is running on this VM right now? (also the liveness "ok": true)
+curl -s http://192.168.2.2:30081/overview | python3 -m json.tool
 
-# Deep status of one template: per-role desired/ready, resolved x,
-# target vs actual sums, per-pod gauges, measured edge traffic.
-curl -s http://192.168.2.2:30081/api/v1/templates/fb/status | python3 -m json.tool
+# Live status: per-role desired/ready, resolved x, target vs actual sums,
+# per-pod gauges, measured edge traffic.
+curl -s http://192.168.2.2:30081/measurements/now | python3 -m json.tool
 
-# Compact CPU/RAM/net digest, averaged over a window (the "just the numbers" view)
-curl -s "http://192.168.2.2:30081/api/v1/templates/fb/summary?range=1h" | python3 -m json.tool
-# Just CPU, per-role, over 30m:
-curl -s "http://192.168.2.2:30081/api/v1/templates/fb/summary?range=30m&resources=cpu&by_role=true" \
+# CPU/RAM/net aggregated over a time window (defaults to the last 15m).
+curl -s "http://192.168.2.2:30081/measurements/range" | python3 -m json.tool
+# A fixed past hour, CPU only (timestamps are controller-local; no offset = local):
+curl -s "http://192.168.2.2:30081/measurements/range?start=2026-06-10T11:00:00&end=2026-06-10T12:00:00&resources=cpu" \
+  | python3 -m json.tool
+# That hour sliced into 10-minute periods:
+curl -s "http://192.168.2.2:30081/measurements/periods?start=2026-06-10T11:00:00&end=2026-06-10T12:00:00&chunk=10m" \
   | python3 -m json.tool
 ```
 
 Scaling a role adds/removes pods *and* re-wires the topology (re-resolves
 x, re-assigns peers + iperf port offsets) — it is not a bare Deployment
-replica bump:
+replica bump. There's no dedicated scale endpoint; PATCH the role's count:
 
 ```bash
-# Set backend to 4 pods (absolute target)
-curl -X POST http://192.168.2.2:30081/api/v1/templates/fb/roles/backend/scale \
-  -H 'Content-Type: application/json' -d '{"replicas": 4}'
+# Set backend to 4 pods
+curl -X PATCH http://192.168.2.2:30081/template \
+  -H 'Content-Type: application/json' -d '{"roles.backend.count": 4}'
 ```
 
-The replica cap is `MAX_REPLICAS_PER_ROLE` (default 20). After a
-scale-up, `…/status` shows new pods with empty `metrics: {}` until they
-become Ready and land in Endpoints — watch them fill in there.
+After a scale-up, `/measurements/now` shows new pods with empty
+`metrics: {}` until they become Ready and land in Endpoints — watch them
+fill in there.
 
 > If the template's `source == "watch"`, the ConfigMap watcher will
-> revert a scale within ~10s. Edit the labelled ConfigMap's `count`
+> revert a PATCH within ~10s. Edit the labelled ConfigMap's `count`
 > instead (Mode B) for a sticky change.
 
-> The windowed `/summary` needs Prometheus reachable at `PROM_URL`. If
-> it isn't, it still returns 200 with `prometheus.available: false` and
-> empty `totals` — overview/status (live-scrape based) keep working
-> regardless.
+> The windowed `/measurements/range` and `/periods` need Prometheus
+> reachable at `PROM_URL`. If it isn't, they still return 200 with
+> `prometheus.available: false` and empty `totals` — overview /
+> measurements/now (live-scrape based) keep working regardless.
 
 ---
 
@@ -261,7 +271,7 @@ If the watcher line is missing, you're on a pre-Step-6 image — rebuild.
 
 ```bash
 microk8s kubectl get all,configmap -l template=<name>
-curl -s http://192.168.2.2:30081/templates/<name> | python3 -m json.tool
+curl -s http://192.168.2.2:30081/template | python3 -m json.tool
 ```
 
 The GET endpoint reconstructs the template from cluster annotations —
@@ -320,9 +330,9 @@ microk8s kubectl logs deployment/wt-<name>-<role> | head -30
 ### Confirm sources don't fight (HTTP + Watch coexistence)
 
 ```bash
-curl -s http://192.168.2.2:30081/templates              # both should appear
-curl -s http://192.168.2.2:30081/templates/<name> | python3 -m json.tool
-# "source": "http"  or  "source": "watch"
+curl -s http://192.168.2.2:30081/overview | python3 -m json.tool   # lists templates + source
+curl -s http://192.168.2.2:30081/template | python3 -m json.tool
+# the /overview entry carries "source": "http"  or  "source": "watch"
 ```
 
 ---
@@ -361,7 +371,7 @@ curl localhost:8080/status
 microk8s kubectl cp <pod>:/etc/emulator/config.json /tmp/config.json
 ```
 
-### POST /templates returns 502
+### POST /template returns 502
 
 A k8s API call failed mid-materialisation. Resources created up to the
 failure point still exist. Re-POST is idempotent (`_apply` falls back to
@@ -398,14 +408,15 @@ microk8s kubectl get podmonitor      # expect: worker AND worker-templates
 ### Tear down everything materialised
 
 ```bash
-# All templates created via HTTP or watch
-for t in $(curl -s http://192.168.2.2:30081/templates | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin)['templates']))"); do
-  curl -X DELETE http://192.168.2.2:30081/templates/$t
-done
+# The materialised template (one per controller)
+curl -X DELETE http://192.168.2.2:30081/template
 
 # Plus any labelled CMs the watcher would otherwise pick up again
 microk8s kubectl get configmap -l emulator.local/template=true -o name \
   | xargs -r microk8s kubectl delete
+
+# Belt-and-braces: anything still labelled as ours
+microk8s kubectl delete all,configmap -l app.kubernetes.io/managed-by=emulator-controller
 ```
 
 ### Tear down the static infrastructure
@@ -439,7 +450,7 @@ microk8s kubectl delete -f manifests/monitoring.yaml
   Default is 40ms (a balance of smoothness and mean accuracy); lower it
   (e.g. 20) for smoother still at a slightly larger under-bias, raise it
   towards stress-ng's coarse default (`0`) for less overhead. For
-  steady-state numbers prefer the windowed `/summary` or Grafana
+  steady-state numbers prefer the windowed `/measurements/range` or Grafana
   `rate(…[1m])` over single-second snapshots. Note the target tracks CPU
   *time* (cgroup `usage_usec`), so CPU-frequency scaling doesn't skew it.
   If a node is oversubscribed (sum of CPU targets > node cores), no knob
@@ -447,6 +458,9 @@ microk8s kubectl delete -f manifests/monitoring.yaml
 - **Endpoint enumeration is one-shot.** Phase 2 reads pod IPs at
   materialise time. If backend pods restart (e.g. rollout, eviction),
   their new IPs aren't propagated — re-POST or re-apply the template.
+  (Inter-tier latency has the same hazard but self-heals: the controller
+  re-resolves the Chaos Mesh rules on every materialise — see
+  `controller/chaos.py`.)
 - **Template formulas must conserve traffic** (see "Template authoring"
   above). The materialiser doesn't validate conservation.
 - **`microk8s kubectl exec --`** is broken by the wrapper. Use
@@ -458,8 +472,9 @@ microk8s kubectl delete -f manifests/monitoring.yaml
 
 ```
 controller/
-  app.py            FastAPI HTTP routes: /templates CRUD + /graph + /api/v1
-  api.py            unified /api/v1 site API: query (k8s+scrape+prom) + scale
+  app.py            FastAPI HTTP routes: /template CRUD + /graph + observability
+  api.py            observability: overview + measurements (k8s + scrape + prom)
+  chaos.py          Chaos Mesh: template-defined latency + auto re-resolve on churn
   prom.py           Prometheus HTTP API client (instant queries), graceful
   graph.py          topology scrape + edge measurement (shared by /graph + api)
   materialiser.py   template → resources, two-phase create + IP resolve

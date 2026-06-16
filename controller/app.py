@@ -30,8 +30,9 @@ POST   /template           materialise the posted template. Re-POSTing the
 GET    /template           the materialised template, in full (404 if none)
 PATCH  /template           partial update — merge, re-resolve, re-materialise.
                            Change anything: x, a role's cpu/ram/net/count/tier,
-                           or edges. Accepts nested JSON or dot-path shorthand,
-                           e.g. {"x": 80, "roles.ingest.cpu.a": 6}
+                           edges, or inter-tier latency. Accepts nested JSON or
+                           dot-path shorthand, e.g. {"x": 80,
+                           "latency.edge.cloud": "150ms"}
 DELETE /template           tear down the materialised template
 GET    /graph              Grafana Node Graph payload (nodes + measured edges);
                            ?view=pods for per-pod nodes (default: per-role)
@@ -57,13 +58,15 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 
 import api
+import chaos
 import graph
 import materialiser
 import watcher
@@ -182,6 +185,17 @@ class Template(BaseModel):
     x: float = 0
     roles: dict[str, Role]
     edges: list[Edge] = []
+    latency: dict[str, dict[str, str]] | None = Field(
+        None,
+        description="Optional inter-tier round-trip times, e.g. "
+                    '{"edge": {"fog": "30ms", "cloud": "120ms"}}. Each pair '
+                    "is rendered into a Chaos Mesh NetworkChaos (half the "
+                    "RTT injected per direction), reconciled across pod "
+                    "churn, and removed on DELETE. Pairs are symmetric — "
+                    "specify each once. Requires Chaos Mesh.",
+        examples=[{"edge": {"fog": "30ms", "cloud": "120ms"},
+                   "fog": {"cloud": "60ms"}}],
+    )
 
 
 def _stamp(payload: dict) -> dict:
@@ -272,6 +286,25 @@ def delete_template():
 
 
 # ── Graph ─────────────────────────────────────────────────────────────────────
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    # Publish the materialised template's CONFIGURED inter-tier RTTs for
+    # Prometheus (the dashboard's "what latency is meant to be" panel).
+    # Recomputed each scrape from the live template, so a PATCH retune shows
+    # up at once; cleared when there's no template or no latency field.
+    pairs: dict = {}
+    names = materialiser.list_managed()
+    if names:
+        info = materialiser.get_managed(names[0])
+        latency = ((info or {}).get("template") or {}).get("latency")
+        try:
+            pairs = chaos.validate_latency(latency)
+        except ValueError:
+            pairs = {}
+    chaos.set_configured_rtt(pairs)
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/graph")
 def get_graph(
     view: str = Query(
