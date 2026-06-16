@@ -2,10 +2,11 @@
 
 HTTP endpoints exposed by the controller and worker pods.
 
-> A machine-readable OpenAPI 3.0 spec of the controller API lives in
-> [`openapi.yaml`](openapi.yaml). Load it into Swagger UI / Redoc, or
-> generate a typed client from it (see the header of that file). This
-> document is the human-readable companion with worked examples.
+> The controller serves a **live, generated OpenAPI spec** at
+> `GET /openapi.json` and an interactive (dark-mode) Swagger UI at
+> `GET /docs` — both always match the running code. This document is the
+> human-readable companion with worked examples. (The checked-in
+> `openapi.yaml` is hand-maintained and may lag; prefer `/openapi.json`.)
 
 The controller is reachable via the NodePort Service in
 `manifests/controller.yaml` (default `30081`). Workers are not normally
@@ -14,91 +15,107 @@ diagnostics, Prometheus scraping, and direct `kubectl port-forward`.
 
 Examples use `192.168.2.2:30081` for the controller (replace with your
 MicroK8s host IP) and `localhost:8080` for the worker (after a
-`kubectl port-forward`). Placeholders like `<name>` and `<role>` refer
-to whatever template / role name you're working with.
+`kubectl port-forward`). Placeholders like `<role>` refer to whatever
+role name you're working with.
 
-The controller serves three independent API surfaces:
+## One controller, one template
 
-- **Templated mode** (`/templates*`) — the primary write API.
-  Materialises whole topologies and resolves x propagation through the
-  role graph. This is what you'll use to create/patch/delete topologies.
-- **Unified site API** (`/api/v1/*`) — the read + scale API. One clean
-  JSON surface that fuses Kubernetes state, live worker gauges, and
-  Prometheus-backed windowed averages, plus role scaling. Every response
-  is tagged with a `site` block for fleet-wide federation. Use this to
-  observe and to add/remove pods.
-- **Health** (`/health`) — controller liveness.
+A controller manages **exactly one template** — the topology for its
+site/VM. The template routes are therefore **singular and take no name**
+(`/template`, not `/templates/<name>`). The template's `name` field still
+exists internally because every Kubernetes resource is named
+`wt-<name>-<role>`. POSTing a second, differently-named template while one
+is materialised returns `409`; re-POSTing the same name re-materialises
+idempotently.
+
+Every JSON response carries a top-level **`timestamp`** (controller-local
+ISO 8601, with offset) recording when it was generated — except `/graph`,
+whose shape is dictated by the Grafana Node Graph panel.
+
+The controller serves three groups of endpoints:
+
+- **Template** (`/template`) — create, inspect, patch, tear down the topology.
+- **Observability** (`/overview`, `/measurements/*`, `/graph`) — query
+  Kubernetes state, live worker gauges, and Prometheus-backed windows.
+- **Worker** (port 8080) — per-pod status and metrics (not on the controller).
 
 ---
 
-# Templated mode (primary API)
+# Template
 
-## `POST /templates`
+## `POST /template`
 
-Materialise a new topology. Validates the template (including cycle
-detection on the role graph), computes the resolved `x` for each role
-via topological propagation, and creates one Deployment + ConfigMap +
-Service per role.
+Materialise the topology. Validates the template (shape, cycle detection
+on the role graph, latency durations), computes the resolved `x` for each
+role via topological propagation, and creates one Deployment + ConfigMap +
+Service per role. After the pods come up it resolves peer IPs (Phase 2) and
+reconciles any inter-tier latency (Phase 3).
 
-`materialise()` is idempotent: POSTing the same `name` again updates
-existing resources via PATCH. You can use this as a "reapply" if you
-ever lose track of state. For surgical updates that only change a few
-fields, prefer `PATCH /templates/<name>` (below).
+Idempotent for the **same** `name`: re-POSTing updates the existing
+resources via PATCH (use it as a "reapply" if you lose track of state). For
+surgical changes prefer `PATCH /template`.
 
 **Body schema:**
 
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
-| `name` | string | yes | k8s name (lowercase + digits + `-`). Becomes the suffix of every resource: `wt-<name>-<role>` |
+| `name` | string | yes | k8s name (lowercase + digits + `-`). Becomes the resource prefix `wt-<name>-<role>` |
 | `x` | number | yes | The signal that drives the topology. Sources use it directly; downstream roles use the resolved cascade |
 | `roles` | object | yes | Map of `role_name → role_spec`. See below |
 | `edges` | array | optional | List of `{"from": role, "to": role}` |
+| `latency` | object | optional | Inter-tier RTTs, applied via Chaos Mesh. See "Inter-tier latency" below |
 
 **Role spec:**
 
 ```json
 {
   "count": 2,
+  "tier": "edge",
   "cpu": {"a": 0, "b": 100},
   "ram": {"a": 0, "b": 128},
   "net": {"a": 0.2, "b": 0}
 }
 ```
 
-Targets are computed per pod as `value = a * x_role + b`, where
-`x_role` is the resolved x for that role (see "x propagation" below).
+Targets are computed per pod as `value = a * x_role + b`, where `x_role` is
+the resolved x for that role (see "x propagation" below). `tier` is optional
+and pins the role's pods to nodes labelled `tier=<value>` (e.g.
+edge / fog / cloud); absent = schedule anywhere.
+
+**Inter-tier latency:**
+
+```json
+"latency": {
+  "edge": { "fog": "30ms", "cloud": "120ms" },
+  "fog":  { "cloud": "60ms" }
+}
+```
+
+Each value is the **round-trip time** you want between pods of the two
+tiers; the controller renders one Chaos Mesh `NetworkChaos` per pair (half
+the RTT injected on egress at each end), reconciles them on every
+materialise (including re-resolving after pod churn), and removes them on
+DELETE. Pairs are symmetric — give each once, in either orientation.
+Durations accept `us` / `ms` / `s`; same-tier pairs, duplicate pairs, and
+RTTs above 10s are rejected with a 400. Requires Chaos Mesh installed
+(skipped with a log warning otherwise); when present, remove any
+hand-applied `manifests/network-chaos.yaml` or the delays stack. Retune
+live with a dot-path PATCH: `{"latency.edge.fog": "50ms"}`. Measured RTTs
+are visible per link via the `worker_peer_rtt_ms` gauge
+(`grafana/grafana-rtt.json`).
 
 **Example:**
 
 ```bash
-curl -X POST http://192.168.2.2:30081/templates \
+curl -X POST http://192.168.2.2:30081/template \
   -H 'Content-Type: application/json' \
-  -d '{
-    "name": "<name>",
-    "x": 10,
-    "roles": {
-      "<source-role>": {
-        "count": 2,
-        "cpu": {"a": 0, "b": 50},
-        "ram": {"a": 0, "b": 64},
-        "net": {"a": 0.2, "b": 0}
-      },
-      "<sink-role>": {
-        "count": 1,
-        "cpu": {"a": 2, "b": 20},
-        "ram": {"a": 5, "b": 256},
-        "net": {"a": 0, "b": 0}
-      }
-    },
-    "edges": [
-      {"from": "<source-role>", "to": "<sink-role>"}
-    ]
-  }'
+  -d @templates/iot-pipeline.json
 ```
 
 **Response (201):**
 ```json
 {
+  "timestamp": "2026-06-12T14:00:00+01:00",
   "name": "<name>",
   "roles": ["<source-role>", "<sink-role>"],
   "peers": {
@@ -113,242 +130,168 @@ curl -X POST http://192.168.2.2:30081/templates \
 | Code | Meaning |
 |------|---------|
 | 201 | Materialised |
-| 400 | Invalid JSON, validation failure, or cycle in the role graph |
+| 400 | Invalid JSON, validation failure, cycle in the role graph, or bad latency |
+| 409 | A *different* template is already materialised — PATCH or DELETE it first |
 | 502 | A k8s API call failed mid-materialisation. Partial resources may exist — re-POST or DELETE to clean up |
-| 500 | Unexpected error |
 
-## `GET /templates`
+## `GET /template`
 
-List the names of all currently materialised templates.
-
-```bash
-curl http://192.168.2.2:30081/templates
-# → {"templates":["<name-1>","<name-2>", ...]}
-```
-
-## `GET /templates/<name>`
-
-Inspect a materialised template. The state is reconstructed from
-ConfigMap annotations and live Deployment replica counts — there's no
-in-memory state on the controller.
+The materialised template, in full (the original POST body, reconstructed
+from ConfigMap annotations — there's no in-memory state on the controller),
+with a `timestamp` prepended.
 
 ```bash
-curl http://192.168.2.2:30081/templates/<name> | python3 -m json.tool
+curl http://192.168.2.2:30081/template | python3 -m json.tool
 ```
 
-Response (200):
+`404` if nothing is materialised. (A re-POST of the GET response round-trips
+cleanly — the controller strips the injected `timestamp` on the way in.)
 
-```json
-{
-  "name": "<name>",
-  "source": "http",
-  "template": { /* original POST body */ },
-  "peers": { /* role → list of Service names */ },
-  "replicas": { "<role>": <count>, ... },
-  "configmaps": ["wt-<name>-<role>-config", ...]
-}
-```
+## `PATCH /template`
 
-`source` is either `"http"` (created via POST) or `"watch"` (created
-by the declarative ConfigMap reconciler — see below).
-
-`404` if no template by that name exists.
-
-## `PATCH /templates/<name>`
-
-Apply a partial update to a running template. Deep-merges the patch
-body into the existing template, re-runs validation (including cycle
-detection), and re-materialises. Workers pick up the new ConfigMap
-within ~60s (kubelet sync) — **no pod restart**.
+Apply a partial update. Deep-merges the patch body into the existing
+template, re-runs validation (including cycle detection), and
+re-materialises. Workers pick up the new ConfigMap within ~60s (kubelet
+sync) — **no pod restart** unless the change adds/removes pods.
 
 **Merge semantics:**
 
 - Dicts merge recursively. `{"roles": {"<role>": {"net": {"a": 0.3}}}}`
-  changes only that role's `net.a`; `net.b` and every other field stay
-  as they were.
-- Scalars and lists in the patch **replace** the existing value. To
-  change one edge, send the whole new `edges` list.
-- The `name` field in the body is ignored — the URL is the source of truth.
-- The `source` annotation (`http` vs `watch`) is preserved.
+  changes only that role's `net.a`.
+- Scalars and lists in the patch **replace** the existing value. To change
+  one edge, send the whole new `edges` list. (`latency` is an object, so a
+  single pair merges in place.)
+- **Dot-path shorthand**: a flat key with dots expands to nested JSON, e.g.
+  `{"latency.edge.cloud": "150ms"}` ≡ `{"latency": {"edge": {"cloud": "150ms"}}}`.
+- The `name` and any injected `timestamp` in the body are ignored.
 
 **Common patches:**
 
 ```bash
 # Change x — the whole topology recascades
-curl -X PATCH http://192.168.2.2:30081/templates/<name> \
-  -H 'Content-Type: application/json' \
-  -d '{"x": 20}'
+curl -X PATCH http://192.168.2.2:30081/template -d '{"x": 20}'
 
 # Bump one role's network — downstream x values re-resolve
-curl -X PATCH http://192.168.2.2:30081/templates/<name> \
-  -H 'Content-Type: application/json' \
-  -d '{"roles":{"<role>":{"net":{"a":0.30}}}}'
+curl -X PATCH http://192.168.2.2:30081/template -d '{"roles.web.net.a": 0.30}'
 
-# Tune one role's RAM (no cascade; only that role changes)
-curl -X PATCH http://192.168.2.2:30081/templates/<name> \
-  -H 'Content-Type: application/json' \
-  -d '{"roles":{"<role>":{"ram":{"b":512}}}}'
+# Scale a role (adds/removes pods; re-resolves x + re-wires peers)
+curl -X PATCH http://192.168.2.2:30081/template -d '{"roles.api.count": 4}'
 
-# Scale a role
-curl -X PATCH http://192.168.2.2:30081/templates/<name> \
-  -H 'Content-Type: application/json' \
-  -d '{"roles":{"<role>":{"count":4}}}'
-
-# Replace the edge list
-curl -X PATCH http://192.168.2.2:30081/templates/<name> \
-  -H 'Content-Type: application/json' \
-  -d '{"edges":[{"from":"<role-a>","to":"<role-b>"}]}'
+# Retune an inter-tier latency live
+curl -X PATCH http://192.168.2.2:30081/template -d '{"latency.edge.cloud": "150ms"}'
 ```
 
-**Response (200):**
+**Response (200):** `{"timestamp", "name", "template": {…merged…}, "peers": {…}}`
 
-```json
-{
-  "name": "<name>",
-  "template": { /* full merged template */ },
-  "peers": { /* role → list of Service names */ }
-}
-```
+**Status codes:** `200` patched · `400` validation/cycle/bad latency ·
+`404` no template materialised · `502` k8s failure.
 
-**Status codes:**
+## `DELETE /template`
 
-| Code | Meaning |
-|------|---------|
-| 200 | Patched |
-| 400 | Invalid JSON, validation failure on the merged result, or cycle |
-| 404 | No template by that name |
-| 502 | k8s API failure during re-materialisation |
-| 500 | Unexpected error |
-
-**Caveat for watch-managed templates:** if `source == "watch"`, the
-controller's labelled-ConfigMap watcher (10s poll) will overwrite your
-PATCH with whatever the labelled CM still says. To make a sticky
-change to a watch-managed template, edit the labelled CM instead
-(`kubectl edit configmap <name>`) — the watcher re-materialises from
-that.
-
-## `DELETE /templates/<name>`
-
-Tear down every resource labelled with this template name. Deployments
-are deleted first (so pods stop using the ConfigMap), then Services,
-then ConfigMaps.
+Tear down every resource for the materialised template. Template-defined
+latency chaos is removed first (while the worker pods are still alive, so
+Chaos Mesh's cleanup is fast), then Deployments, Services, and ConfigMaps.
 
 ```bash
-curl -X DELETE http://192.168.2.2:30081/templates/<name>
-# → {"name":"<name>","deleted":<count>}
+curl -X DELETE http://192.168.2.2:30081/template
+# → {"timestamp":"…","name":"<name>","deleted":<count>}
 ```
 
-`deleted` is the number of Kubernetes objects removed (rough count).
-Returns 404 if no template with that name is materialised; during the
-teardown itself, a kind that is already absent is treated as
-already-gone rather than an error.
+`404` if nothing is materialised. `deleted` counts the Kubernetes objects
+removed.
 
 ---
 
-# Unified site API (`/api/v1`)
+# Observability
 
-The `/api/v1` surface is the **single place to query everything this
-controller knows and to scale roles up/down**, in clean JSON. It fuses
-three data sources behind one envelope:
+Read endpoints fuse three data sources behind one envelope:
 
 - **Kubernetes live state** — Deployments (desired replicas) and Pods
   (phase, readiness, restarts, node, age) via the k8s API.
 - **Instantaneous worker gauges** — scraped straight from each pod's
   `/metrics` (no Prometheus dependency).
-- **Windowed averages** — via the Prometheus HTTP API (`PROM_URL`),
-  for CPU/RAM/net averaged over a time window (the `/summary` endpoint).
+- **Windowed aggregates** — via the Prometheus HTTP API (`PROM_URL`), for
+  the `/measurements/range` and `/measurements/periods` endpoints.
 
 ### Site identity & federation
 
-Every `/api/v1` response carries a `site` block:
+Every observability response carries a `site` block:
 
 ```json
 "site": {"id": "<SITE_ID>", "tier": "<SITE_TIER>"}
 ```
 
-One controller runs per VM, and each VM plays a part in a larger cloud
-system (edge / fog / cloud). `SITE_ID` / `SITE_TIER` are set per
-controller via env (`manifests/controller.yaml`; default
-`"local"` / `"unknown"`). The block lets a future federation gateway
-fan out to many controllers and merge responses by site with no schema
-change here.
+One controller runs per VM; `SITE_ID` / `SITE_TIER` are set per controller
+via env (`manifests/controller.yaml`; default `"local"` / `"unknown"`). The
+block lets a future federation gateway fan out to many controllers and merge
+responses by site with no schema change.
 
-## `GET /api/v1/overview`
+### Timezone
 
-Site-wide snapshot: every materialised template with per-role desired
-vs ready replica counts and a pod-health rollup. The "what is running
-here" endpoint.
+Timestamps in responses (and naive request timestamps to
+`/measurements/*`) use the controller's local timezone, set via the `TZ`
+env var (default `Europe/London`). Internals compute in absolute unix time,
+so this is presentation only; rendered values carry their UTC offset so
+they stay unambiguous.
+
+## `GET /overview`
+
+Site-wide snapshot — every materialised template with per-role desired vs
+ready replica counts and a pod-health rollup. **Subsumes the old `/health`
+endpoint**: the `"ok": true` field is present whenever the web layer is up
+(the k8s readiness probe itself is now a cheap TCP-socket check, not an HTTP
+hit on this heavier endpoint).
 
 ```bash
-curl http://192.168.2.2:30081/api/v1/overview | python3 -m json.tool
+curl http://192.168.2.2:30081/overview | python3 -m json.tool
 ```
 
 **Response (200):**
-
 ```json
 {
-  "site": {"id": "local", "tier": "unknown"},
-  "namespace": "default",
+  "timestamp": "2026-06-12T14:00:00+01:00",
+  "ok": true,
+  "site": {"id": "local", "tier": "cloud"},
+  "namespace": "cloud-native-emulator",
   "templates": [
-    {
-      "name": "<name>",
-      "source": "http",
-      "roles": {
-        "<role>": {"desired": 2, "ready": 2}
-      },
-      "pods": {"total": 3, "ready": 3}
-    }
+    {"name": "<name>", "source": "http",
+     "roles": {"<role>": {"desired": 2, "ready": 2}},
+     "pods": {"total": 3, "ready": 3}}
   ],
   "prometheus": {"available": true, "url": "http://…:9090"}
 }
 ```
 
-## `GET /api/v1/templates/<name>/status`
+## `GET /measurements/now`
 
-Rich per-template status. For each role: desired/ready replicas, the
-resolved `x`, role-level target and actual sums (CPU/RAM/NET), and a
-per-pod list fusing k8s state with that pod's current worker gauges.
-Also returns measured role→role edge traffic.
+Rich, instantaneous per-role status. For each role: desired/ready replicas,
+the resolved `x`, role-level target and actual sums (CPU/RAM/NET), and a
+per-pod list fusing k8s state with that pod's current worker gauges. Also
+returns measured role→role edge traffic. Live scrapes only — no Prometheus.
 
-Pods that exist in k8s but aren't in Endpoints yet (starting up, not
-Ready) are surfaced with an empty `metrics: {}` so an in-progress
-scale-up is visible rather than silently missing.
+Pods that exist in k8s but aren't in Endpoints yet (starting up, not Ready)
+are surfaced with an empty `metrics: {}`, so an in-progress scale-up is
+visible rather than silently missing.
 
 ```bash
-curl http://192.168.2.2:30081/api/v1/templates/<name>/status | python3 -m json.tool
+curl http://192.168.2.2:30081/measurements/now | python3 -m json.tool
 ```
 
-**Response (200):**
-
+**Response (200, abridged):**
 ```json
 {
-  "site": {"id": "local", "tier": "unknown"},
+  "timestamp": "2026-06-12T14:00:00+01:00",
+  "site": {"id": "local", "tier": "cloud"},
   "name": "<name>",
-  "source": "http",
   "roles": {
     "<role>": {
-      "desired": 2,
-      "ready": 2,
-      "x": 10.0,
+      "desired": 2, "ready": 2, "x": 10.0,
       "targets": {"cpu_millicores": 100.0, "ram_mb": 128.0, "net_mbps": 4.0},
       "actuals": {"cpu_millicores": 98.2, "ram_mb": 130.1, "net_mbps": 3.9},
-      "pods": [
-        {
-          "name": "wt-<name>-<role>-abc123",
-          "ip": "10.1.0.42",
-          "node": "node-1",
-          "phase": "Running",
-          "ready": true,
-          "restarts": 0,
-          "age_seconds": 312,
-          "metrics": {
-            "x": 10.0,
-            "target_cpu_millicores": 50.0, "actual_cpu_millicores": 49.1,
-            "target_ram_mb": 64.0,         "actual_ram_mb": 65.0,
-            "target_net_mbps": 2.0,        "actual_net_mbps": 1.95
-          }
-        }
-      ]
+      "pods": [{"name": "wt-<name>-<role>-abc123", "ip": "10.1.0.42",
+                "node": "node-1", "phase": "Running", "ready": true,
+                "restarts": 0, "age_seconds": 312,
+                "metrics": {"x": 10.0, "target_cpu_millicores": 50.0, "...": "..."}}]
     }
   },
   "edges": [{"from": "<role-a>", "to": "<role-b>", "mbps": 3.912}],
@@ -356,184 +299,125 @@ curl http://192.168.2.2:30081/api/v1/templates/<name>/status | python3 -m json.t
 }
 ```
 
-`prometheus.available` is `null` here — this endpoint reads live
-scrapes, not Prometheus. Use `/summary` (below) for windowed averages.
+`404` if nothing is materialised.
 
-`404` if no template by that name exists.
+## `GET /measurements/range`
 
-## `GET /api/v1/templates/<name>/summary`
-
-A compact, human-readable digest of **CPU, RAM, and network** for a
-template, **averaged over a window** — the "just tell me the numbers"
-endpoint. Rather than returning full per-pod time series, it returns a
-handful of scalars: the template-wide target and actual *summed across
-pods* and then reduced over the window.
+CPU/RAM/network for the template, **aggregated between two points in
+time** — the "just tell me the numbers" endpoint. Returns scalars: the
+template-wide target and actual summed across pods then reduced over the
+interval, **always** broken down by role and accompanied by an `x` block.
 
 **Query params:**
 
 | Param | Default | Notes |
 |-------|---------|-------|
-| `range` | `15m` | Window length. Bare Prometheus duration (`s`/`m`/`h`/`d`); anything else falls back to 15m |
-| `resources` | `cpu,ram,net` | Comma-separated subset to include. Unknown values → 400 |
-| `by_role` | `false` | `true` adds a per-role breakdown (avg only) |
-| `include_x` | `false` | `true` adds an `x` block: each role → its resolved input `x` |
+| `start` | `end` − 15m | ISO 8601 (`2026-06-10T11:00:00`) or unix epoch seconds. No offset ⇒ controller-local time; `Z`/offset honoured |
+| `end` | now | Same formats as `start` |
+| `resources` | `cpu,ram,net` | Comma-separated subset. Unknown values → 400 |
 
-For each resource the totals carry `target_avg`, `actual_avg`,
-`actual_min`, and `actual_max` (the per-role breakdown carries the two
-averages only). Values are summed across all of the template's pods,
-then averaged / min'd / max'd over the window via a Prometheus
-subquery, and rounded to 3 dp. The `x` block (when requested) is
-averaged — not summed — across each role's pods, since every pod of a
-role shares the same resolved `x`.
+`totals` carries `target_avg`, `actual_avg`, `actual_min`, `actual_max`;
+the per-role breakdown carries the two averages. The `x` block is split by
+provenance: **`input`** (source roles, whose x *is* the template's x) and
+**`derived`** (downstream roles, x propagated from upstream egress). Both
+are averaged — not summed — across each role's pods.
 
 ```bash
-# Whole-template digest over the last hour
-curl -s "http://192.168.2.2:30081/api/v1/templates/<name>/summary?range=1h" \
-  | python3 -m json.tool
+# Last 15 minutes (defaults)
+curl -s "http://192.168.2.2:30081/measurements/range" | python3 -m json.tool
 
-# Just CPU, broken down by role, over 30 minutes
-curl -s "http://192.168.2.2:30081/api/v1/templates/<name>/summary?range=30m&resources=cpu&by_role=true" \
-  | python3 -m json.tool
-
-# Include the resolved x per role
-curl -s "http://192.168.2.2:30081/api/v1/templates/<name>/summary?range=1h&include_x=true" \
+# A fixed hour, CPU + net only
+curl -s "http://192.168.2.2:30081/measurements/range?start=2026-06-10T11:00:00&end=2026-06-10T12:00:00&resources=cpu,net" \
   | python3 -m json.tool
 ```
 
-**Response (200):**
-
+**Response (200, abridged):**
 ```json
 {
-  "site": {"id": "local", "tier": "unknown"},
+  "timestamp": "2026-06-12T14:00:00+01:00",
+  "site": {"id": "local", "tier": "cloud"},
   "name": "<name>",
-  "range": "1h",
-  "totals": {
-    "cpu_millicores": {"target_avg": 980.0, "actual_avg": 951.2, "actual_min": 902.0, "actual_max": 1010.5},
-    "ram_mb":         {"target_avg": 707.8, "actual_avg": 712.4, "actual_min": 690.1, "actual_max": 730.9},
-    "net_mbps":       {"target_avg": 15.6,  "actual_avg": 14.9,  "actual_min": 0.0,   "actual_max": 16.2}
-  },
-  "roles": {
-    "api": {
-      "cpu_millicores": {"target_avg": 484.8, "actual_avg": 470.1},
-      "ram_mb":         {"target_avg": 231.6, "actual_avg": 233.0},
-      "net_mbps":       {"target_avg": 9.12,  "actual_avg": 8.7}
-    }
-  },
-  "x": {"gateway": 12.0, "auth": 6.8, "api": 6.8, "queue": 9.12, "cache": 9.12, "db": 6.92},
+  "start": "2026-06-10T11:00:00+01:00",
+  "end":   "2026-06-10T12:00:00+01:00",
+  "window": "3600s",
+  "totals": {"cpu_millicores": {"target_avg": 980.0, "actual_avg": 951.2,
+                                "actual_min": 902.0, "actual_max": 1010.5}, "...": "..."},
+  "roles":  {"<role>": {"cpu_millicores": {"target_avg": 484.8, "actual_avg": 470.1}, "...": "..."}},
+  "x": {"input":   {"<source>": 40.0},
+        "derived": {"<downstream>": 31.5}},
   "prometheus": {"available": true, "url": "http://…:9090"}
 }
 ```
 
-`roles` is present only when `by_role=true`; `x` is present only when
-`include_x=true`.
+**Errors:** `400` on an unknown resource, `start >= end`, or a window over
+31 days. `404` if nothing is materialised. If Prometheus is unreachable,
+returns 200 with `prometheus.available: false` and empty
+`totals`/`roles`/`x` — use `/measurements/now` for a live, no-Prometheus
+alternative.
 
-**Graceful degradation:** if Prometheus is unreachable, returns 200 with
-`prometheus.available: false`, `totals: {}` (and `roles: {}` when
-requested). For a live, no-Prometheus alternative use `…/status`, whose
-per-role `targets`/`actuals` are the current (instantaneous) sums.
+## `GET /measurements/periods`
 
-`404` if no template by that name exists.
+The same interval **split into consecutive equal chunks**, each aggregated
+separately — for seeing how the numbers move over a run rather than one
+flattened average.
 
-## `POST /api/v1/templates/<name>/roles/<role>/scale`
+**Query params:** `start`, `end`, `resources` as above, plus:
 
-Add or remove pods for one role. Implemented over
-`PATCH /templates/<name>` (`materialiser.patch_template`), so scaling
-**re-resolves x through the role graph and re-runs peer/port-offset
-assignment** — freshly added pods are fully wired into the topology,
-not just bare Deployment replicas.
+| Param | Required | Notes |
+|-------|----------|-------|
+| `chunk` | yes | Length of each chunk, e.g. `90s`, `10m`, `1h` (min `30s`, the scrape interval) |
 
-**Body:**
-
-| Field | Type | Notes |
-|-------|------|-------|
-| `replicas` | integer | Required. Absolute target count |
-
-Target must be `>= 1` and `<= MAX_REPLICAS_PER_ROLE` (default 20;
-overridable via env on the controller).
+The range is split into as many **full** chunks of `chunk` as fit, anchored
+at `start`; a trailing remainder shorter than `chunk` is dropped and
+reported as `remainder_s`.
 
 ```bash
-# Set <role> to 4 pods
-curl -X POST http://192.168.2.2:30081/api/v1/templates/<name>/roles/<role>/scale \
-  -H 'Content-Type: application/json' -d '{"replicas": 4}'
+# A one-hour run sliced into 10-minute periods
+curl -s "http://192.168.2.2:30081/measurements/periods?start=2026-06-10T11:00:00&end=2026-06-10T12:00:00&chunk=10m" \
+  | python3 -m json.tool
 ```
 
-**Response (200):**
-
+**Response (200, abridged):**
 ```json
 {
-  "site": {"id": "local", "tier": "unknown"},
-  "name": "<name>",
-  "role": "<role>",
-  "previous": 2,
-  "replicas": 4,
-  "peers": { "<role>": ["wt-<name>-<peer>"], … }
+  "timestamp": "…", "site": {"…": "…"}, "name": "<name>",
+  "start": "…", "end": "…", "window": "3600s",
+  "chunk": "600s", "count": 6,
+  "periods": [
+    {"start": "…", "end": "…",
+     "totals": {"…": "…"}, "roles": {"…": "…"},
+     "x": {"input": {"…": "…"}, "derived": {"…": "…"}}}
+  ],
+  "prometheus": {"available": true, "url": "http://…:9090"}
 }
 ```
 
-**Status codes:**
+**Errors:** `400` for a missing/malformed `chunk`, a chunk longer than the
+range, or more than 100 chunks. `404` if nothing is materialised.
 
-| Code | Meaning |
-|------|---------|
-| 200 | Scaled |
-| 400 | Invalid JSON, unknown role, missing/non-integer `replicas`, or out-of-range target |
-| 404 | No template by that name |
-| 502 | k8s API failure during re-materialisation |
-| 500 | Unexpected error |
+## `GET /graph`
 
-> Same watch-managed caveat as `PATCH`: if `source == "watch"`, the
-> ConfigMap watcher will overwrite a scale within ~10s. Edit the
-> labelled ConfigMap's `count` instead for a sticky change. Check with
-> `curl -s http://192.168.2.2:30081/templates/<name> | jq .source`.
+Grafana Node Graph payload (nodes + measured edges) for the materialised
+template — the data source behind `grafana/grafana-nodegraph.json`. **No
+`timestamp`** — the panel rejects unknown top-level keys.
 
-**Verifying a scale took effect:**
+| Param | Default | Notes |
+|-------|---------|-------|
+| `view` | `role` | `role`: one node per role, stats summed across its pods, edges role→role. `pods`: one node per pod, raw pod→pod edges |
 
 ```bash
-curl -s http://192.168.2.2:30081/api/v1/templates/<name>/status \
-  | jq '.roles.<role> | {desired, ready, x, pods: (.pods | length)}'
+curl http://192.168.2.2:30081/graph | python3 -m json.tool
+curl "http://192.168.2.2:30081/graph?view=pods" | python3 -m json.tool
 ```
 
-Freshly added pods appear with `"metrics": {}` until they are Ready and
-land in Endpoints (Phase-2 wiring) — an in-progress scale-up is visible
-rather than silently missing.
-
-Scaling a **sender** role re-resolves `x` for everything downstream
-(it's a full re-materialise, not a Deployment replica edit). Watch every
-role's resolved `x` shift after scaling a source:
-
-```bash
-curl -s http://192.168.2.2:30081/api/v1/templates/<name>/status \
-  | jq '.roles | map_values(.x)'
-```
-
-**Validation — these all return `400`** (append `-w '\n%{http_code}\n'`
-to see the status):
-
-```bash
-S=http://192.168.2.2:30081/api/v1/templates/<name>/roles/<role>/scale
-curl -s -X POST $S -H 'Content-Type: application/json' -d '{}'                       # missing replicas
-curl -s -X POST $S -H 'Content-Type: application/json' -d '{"replicas":0}'           # below 1
-curl -s -X POST $S -H 'Content-Type: application/json' -d '{"replicas":21}'          # above MAX_REPLICAS_PER_ROLE
-curl -s -X POST $S -H 'Content-Type: application/json' -d '{"replicas":2.5}'         # non-integer
-curl -s -X POST $S -H 'Content-Type: application/json' -d '{"replicas":true}'        # boolean
-```
-
-**Unknown role (`400`) vs unknown template (`404`):**
-
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-  http://192.168.2.2:30081/api/v1/templates/<name>/roles/nope/scale \
-  -H 'Content-Type: application/json' -d '{"replicas":2}'      # 400
-curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-  http://192.168.2.2:30081/api/v1/templates/ghost/roles/<role>/scale \
-  -H 'Content-Type: application/json' -d '{"replicas":2}'      # 404
-```
+`404` if nothing is materialised.
 
 ---
 
-## x propagation — the model behind templated mode
+## x propagation — the model behind the template
 
-The template's `x` is a *signal* that flows through the role graph,
-not a global constant shared by every role.
+The template's `x` is a *signal* that flows through the role graph, not a
+global constant shared by every role.
 
 ```
 template.x   ──▶  source roles (no inbound edges)
@@ -548,36 +432,28 @@ template.x   ──▶  source roles (no inbound edges)
 ```
 
 For each role, the controller computes `x_role` via a topological pass
-(Kahn's algorithm). A source role's x is `template.x`; a downstream
-role's x is the sum of upstream role-total egress. All three of CPU,
-RAM, and NET formulas evaluate at this resolved x.
+(Kahn's algorithm). A source role's x is `template.x`; a downstream role's x
+is the sum of upstream role-total egress. All three of CPU, RAM, and NET
+formulas evaluate at this resolved x. The `/measurements/range` and
+`/periods` responses split these into `x.input` (sources) and `x.derived`
+(downstream).
 
 Self-edges (intra-role mesh, `from == to`) are legal traffic-wise but
-ignored for x-resolution — a role can't feed its own x without
-circularity.
-
-Cycles in the role graph are rejected at validate time (400 with
-`role graph has a cycle involving: …`).
-
-The resolved x per role is logged at materialise time:
-
-```
-[controller] Template <name>: resolved x per role = {'<role-a>': 10.0, '<role-b>': 8.0, ...}
-```
-
-It's also visible per pod in Grafana as the `worker_input_x` gauge.
+ignored for x-resolution. Cycles in the role graph are rejected at validate
+time (`400`, `role graph has a cycle involving: …`). The resolved x per role
+is logged at materialise time and visible per pod as the `worker_input_x`
+gauge.
 
 ---
 
 ## Declarative ingestion (no HTTP needed)
 
-The controller also reconciles ConfigMaps labelled with
+The controller also reconciles ConfigMaps labelled
 `emulator.local/template: "true"`. A polling watcher
 (`controller/watcher.py`, 10s interval) calls into the same
 `materialise()` / `teardown()` codepaths used by `POST` and `DELETE`.
 
 ```yaml
-# <name>-template.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -586,37 +462,18 @@ metadata:
     emulator.local/template: "true"
 data:
   template.json: |
-    {
-      "x": 10,
-      "roles": { ... },
-      "edges": [ ... ]
-    }
+    {"x": 10, "roles": { ... }, "edges": [ ... ]}
 ```
 
 ```bash
 microk8s kubectl apply -f <name>-template.yaml   # materialises within ~15s
 microk8s kubectl edit configmap <name>           # live edit → re-materialise
-microk8s kubectl delete configmap <name>         # tears the whole topology down
+microk8s kubectl delete configmap <name>         # tears the topology down
 ```
 
 The template's `name` comes from `metadata.name`; any `name` inside
-`template.json` is overwritten.
-
-HTTP and watch sources coexist: templates carry a `source` annotation
-and the watcher only tears down templates it created.
-
----
-
-# Health
-
-## `GET /health`
-
-Liveness probe. Always returns 200 as long as the HTTP server is up.
-
-```bash
-curl http://192.168.2.2:30081/health
-# → {"ok":true}
-```
+`template.json` is overwritten. HTTP- and watch-created templates carry a
+`source` annotation and the watcher only tears down templates it created.
 
 ---
 
@@ -638,11 +495,7 @@ curl http://localhost:8080/health
 
 ## `GET /status`
 
-Returns the worker's full `STATE` dict — what it's currently doing.
-
-```bash
-curl http://localhost:8080/status | python3 -m json.tool
-```
+The worker's full `STATE` dict — what it's currently doing.
 
 ```json
 {
@@ -651,17 +504,13 @@ curl http://localhost:8080/status | python3 -m json.tool
   "cpu_millicores": <cpu.a * x + cpu.b>,
   "ram_mb": <ram.a * x + ram.b>,
   "net_mbps": <net.a * x + net.b>,
-  "formulas": {
-    "cpu": {"a": <a>, "b": <b>},
-    "ram": {"a": <a>, "b": <b>},
-    "net": {"a": <a>, "b": <b>}
-  },
-  "peers": ["<peer-ip-1>", "<peer-ip-2>", ...]
+  "formulas": {"cpu": {"a": …, "b": …}, "ram": {"a": …, "b": …}, "net": {"a": …, "b": …}},
+  "peers": ["<peer-ip-1>", "<peer-ip-2>", …]
 }
 ```
 
-For a templated worker, `x` here is the *resolved* x for this pod's
-role, and `peers` is the list of concrete pod IPs (not Service names).
+For a templated worker, `x` is the *resolved* x for this pod's role, and
+`peers` is the list of concrete pod IPs (not Service names).
 
 ## `GET /metrics`
 
@@ -670,15 +519,15 @@ Prometheus text-format scrape endpoint. Gauges exposed:
 | Metric | Meaning |
 |--------|---------|
 | `worker_input_x` | Resolved x for this role |
-| `worker_target_cpu_millicores` | `cpu.a * x + cpu.b` |
-| `worker_target_ram_mb` | `ram.a * x + ram.b` |
-| `worker_target_net_mbps` | `net.a * x + net.b` |
+| `worker_target_cpu_millicores` / `_ram_mb` / `_net_mbps` | `a * x + b` per resource |
 | `worker_actual_cpu_millicores` | 15s rolling average from cgroup `cpu.stat` |
 | `worker_actual_ram_mb` | cgroup working set (matches cAdvisor / Grafana) |
 | `worker_actual_net_mbps` | 15s rolling egress rate from `psutil.net_io_counters` |
+| `worker_cpu_stress_millicores` | CPU the feedback loop currently asks stress-ng to generate |
+| `worker_peer_egress_mbps{peer}` | Measured egress to a specific peer IP (from iperf3 interval reports) |
+| `worker_peer_rtt_ms{peer}` | TCP-handshake RTT to a peer pod, probed every 15s — includes injected inter-tier latency |
 
-All gauges are scraped by Prometheus via the `worker-templates`
-PodMonitor in `manifests/monitoring.yaml`.
+All gauges are scraped via the PodMonitor in `manifests/monitoring.yaml`.
 
 ```bash
 curl -s http://localhost:8080/metrics | grep -E "^worker_"
@@ -688,30 +537,25 @@ curl -s http://localhost:8080/metrics | grep -E "^worker_"
 
 # Quick reference
 
-## Templated mode (primary)
+## Template
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/templates` | Create a topology |
-| GET | `/templates` | List topologies |
-| GET | `/templates/<name>` | Inspect a topology |
-| PATCH | `/templates/<name>` | Partial update — merges, re-resolves, re-materialises |
-| DELETE | `/templates/<name>` | Tear a topology down |
+| POST | `/template` | Materialise the topology (409 if a different one exists) |
+| GET | `/template` | The materialised template, in full |
+| PATCH | `/template` | Partial update — merges, re-resolves, re-materialises |
+| DELETE | `/template` | Tear the topology down |
 
-## Unified site API (`/api/v1`)
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/api/v1/overview` | Site-wide snapshot of all templates |
-| GET | `/api/v1/templates/<name>/status` | Rich per-role state + live gauges + edges |
-| GET | `/api/v1/templates/<name>/summary` | CPU/RAM/net averaged over a window (`?range=&resources=&by_role=&include_x=`) |
-| POST | `/api/v1/templates/<name>/roles/<role>/scale` | Scale a role to `replicas` pods |
-
-## Health
+## Observability
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/health` | Controller liveness |
+| GET | `/overview` | Site-wide snapshot (subsumes `/health`) |
+| GET | `/measurements/now` | Live per-role state + gauges + edges |
+| GET | `/measurements/range` | CPU/RAM/net aggregated over `?start`–`?end` |
+| GET | `/measurements/periods` | The range split into `?chunk`-sized periods |
+| GET | `/graph` | Grafana Node Graph payload (`?view=role\|pods`) |
+| GET | `/docs`, `/openapi.json` | Swagger UI (dark) and the generated spec |
 
 ## Worker (port-forward to access)
 

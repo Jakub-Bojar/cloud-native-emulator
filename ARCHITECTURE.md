@@ -5,7 +5,7 @@ is provided in both Mermaid (rendered by GitHub, Notion, most IDEs) and
 ASCII (paste-anywhere fallback).
 
 1. [System overview](#1-system-overview) — components and who talks to whom
-2. [Template lifecycle](#2-template-lifecycle) — what happens on `POST /templates`
+2. [Template lifecycle](#2-template-lifecycle) — what happens on `POST /template`
 3. [Worker pod internals](#3-worker-pod-internals) — what's inside a single pod
 4. [x propagation](#4-x-propagation) — how the input signal cascades through roles
 5. [Two-phase materialisation](#5-two-phase-materialisation) — why deploys take two passes
@@ -53,7 +53,7 @@ flowchart TB
         end
     end
 
-    User -->|"POST/PATCH/DELETE /templates"| Controller
+    User -->|"POST/PATCH/DELETE /template"| Controller
     User -->|"kubectl apply"| LCM
     LCM -.->|"10s poll"| Controller
     Controller -->|"create / patch"| K8sAPI
@@ -72,7 +72,7 @@ flowchart TB
                     │ User / CI   │
                     └──────┬──────┘
        curl POST/PATCH/    │           kubectl apply
-       DELETE /templates   │           (labelled CM)
+       DELETE /template    │           (labelled CM)
                            ▼
    ┌───────────────────────────────────────────────────────────────┐
    │                                                               │
@@ -122,7 +122,7 @@ flowchart TB
 
 ## 2. Template lifecycle
 
-The sequence of events when a user calls `POST /templates`. Highlights
+The sequence of events when a user calls `POST /template`. Highlights
 the two-phase materialisation that's central to the design.
 
 ### Mermaid
@@ -136,7 +136,7 @@ sequenceDiagram
     participant K8s as Kubernetes API
     participant Pod as Worker Pod(s)
 
-    User->>Ctrl: POST /templates {name, x, roles, edges}
+    User->>Ctrl: POST /template {name, x, roles, edges}
     Ctrl->>Mat: validate(template)
     Note over Mat: Schema check<br/>+ cycle detection
     Mat-->>Ctrl: ok (or 400 ValueError)
@@ -172,7 +172,7 @@ sequenceDiagram
 ```
    User              Controller         Materialiser        K8s API         Worker Pods
     │                    │                   │                 │                 │
-    │ POST /templates    │                   │                 │                 │
+    │ POST /template     │                   │                 │                 │
     ├───────────────────▶│                   │                 │                 │
     │                    │ validate()        │                 │                 │
     │                    ├──────────────────▶│                 │                 │
@@ -442,7 +442,7 @@ peers in a second sweep.
 
 ```mermaid
 flowchart TB
-    Start([POST /templates])
+    Start([POST /template])
 
     subgraph phase1["Phase 1 — empty peers"]
         P1A["Render blueprint per role<br/>(substitute __TEMPLATE__, __ROLE__, etc.)"]
@@ -469,7 +469,7 @@ flowchart TB
 ### ASCII
 
 ```
-                              POST /templates
+                              POST /template
                                      │
                                      ▼
                           validate (incl. cycles)
@@ -523,17 +523,18 @@ flowchart TB
 
 ## 6. Site API & federation roadmap
 
-Each controller is the **site API for one VM**. The `/api/v1` surface
-(see `API.md`) fuses three data sources behind one envelope — Kubernetes
-state, live worker `/metrics` scrapes, and Prometheus time series — and
-also exposes role scaling. Every response is tagged with a `site` block
-(`{id, tier}`, from `SITE_ID` / `SITE_TIER` env), so responses are
-self-describing about *which* part of the cloud they came from.
+Each controller is the **site API for one VM** and manages one template.
+The observability endpoints (`/overview`, `/measurements/*`; see `API.md`)
+fuse three data sources behind one envelope — Kubernetes state, live worker
+`/metrics` scrapes, and Prometheus time series. Every response is tagged
+with a `site` block (`{id, tier}`, from `SITE_ID` / `SITE_TIER` env) and a
+generation `timestamp`, so responses are self-describing about *which* part
+of the cloud they came from and *when*.
 
 The design goal: one VM today behaves exactly like one node of a fleet
 tomorrow. Standing up edge / fog / cloud VMs means deploying the same
 image to each with a different `SITE_ID` / `SITE_TIER`. A future
-**federation gateway** fans the same `/api/v1` calls out to every
+**federation gateway** fans the same observability calls out to every
 controller and merges responses by `site` — no schema change on the
 controller, because the `site` block is already there.
 
@@ -545,25 +546,25 @@ flowchart TB
     GW["<b>Federation Gateway</b> (future)<br/>fan-out + merge by site"]
 
     subgraph edge["Edge VM"]
-        CE["Controller<br/>SITE_ID=edge-1 · tier=edge<br/>/api/v1 + site block"]
+        CE["Controller<br/>SITE_ID=edge-1 · tier=edge<br/>observability + site block"]
         WE["worker pods"]
         CE --- WE
     end
     subgraph fog["Fog VM"]
-        CF["Controller<br/>SITE_ID=fog-1 · tier=fog<br/>/api/v1 + site block"]
+        CF["Controller<br/>SITE_ID=fog-1 · tier=fog<br/>observability + site block"]
         WF["worker pods"]
         CF --- WF
     end
     subgraph cloud["Cloud VM"]
-        CC["Controller<br/>SITE_ID=cloud-1 · tier=cloud<br/>/api/v1 + site block"]
+        CC["Controller<br/>SITE_ID=cloud-1 · tier=cloud<br/>observability + site block"]
         WC["worker pods"]
         CC --- WC
     end
 
     Client --> GW
-    GW -->|"GET /api/v1/overview"| CE
-    GW -->|"GET /api/v1/overview"| CF
-    GW -->|"GET /api/v1/overview"| CC
+    GW -->|"GET /overview"| CE
+    GW -->|"GET /overview"| CF
+    GW -->|"GET /overview"| CC
     CE -.->|"{site:{id,tier}, …}"| GW
     CF -.->|"{site:{id,tier}, …}"| GW
     CC -.->|"{site:{id,tier}, …}"| GW
@@ -578,10 +579,10 @@ flowchart TB
                                       ▼
                        ┌───────────────────────────┐
                        │  Federation Gateway        │  (future)
-                       │  fan-out /api/v1 + merge    │
+                       │  fan-out /overview + merge  │
                        │  responses by `site`        │
                        └───┬───────────┬───────────┬┘
-              /api/v1      │           │           │
+              /overview    │           │           │
                           ▼           ▼           ▼
                    ┌──────────┐ ┌──────────┐ ┌──────────┐
                    │ Edge VM  │ │ Fog VM   │ │ Cloud VM │
@@ -598,7 +599,7 @@ flowchart TB
 
 | Piece | Status |
 |-------|--------|
-| Per-VM `/api/v1` query + scale | **Implemented** |
+| Per-VM observability query (overview + measurements) | **Implemented** |
 | `site` block on every response | **Implemented** |
 | `SITE_ID` / `SITE_TIER` per controller (env) | **Implemented** |
 | Prometheus time-series passthrough (`PROM_URL`) | **Implemented** |
