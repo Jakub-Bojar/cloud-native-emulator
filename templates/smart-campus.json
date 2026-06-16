@@ -1,6 +1,10 @@
 {
   "name": "smart-campus",
   "x": 40,
+  "latency": {
+    "edge": { "fog": "10ms", "cloud": "100ms" },
+    "fog":  { "cloud": "40ms" }
+  },
   "roles": {
     "cameras":     { "count": 2, "tier": "edge",  "cpu": { "a": 1,   "b": 80 },  "ram": { "a": 0.5,  "b": 64 },  "net": { "a": 0.2,  "b": 4 } },
     "iot-sensors": { "count": 3, "tier": "edge",  "cpu": { "a": 0.5, "b": 40 },  "ram": { "a": 0.25, "b": 40 },  "net": { "a": 0.1,  "b": 2 } },

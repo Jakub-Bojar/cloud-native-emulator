@@ -1,6 +1,10 @@
 {
   "name": "retail-chain",
   "x": 30,
+  "latency": {
+    "edge": { "fog": "50ms", "cloud": "120ms" },
+    "fog":  { "cloud": "80ms" }
+  },
   "roles": {
     "pos":          { "count": 3, "tier": "edge",  "cpu": { "a": 1.5, "b": 50 },  "ram": { "a": 0.5, "b": 40 },  "net": { "a": 0.2,  "b": 2 } },
     "shelf-cams":   { "count": 2, "tier": "edge",  "cpu": { "a": 2,   "b": 70 },  "ram": { "a": 1,   "b": 64 },  "net": { "a": 0.3,  "b": 3 } },

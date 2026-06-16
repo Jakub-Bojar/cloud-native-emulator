@@ -1,6 +1,10 @@
 {
   "name": "iot-pipeline",
   "x": 50,
+  "latency": {
+    "edge": { "fog": "10ms", "cloud": "100ms" },
+    "fog":  { "cloud": "40ms" }
+  },
   "roles": {
     "sensor": {
       "count": 3,
