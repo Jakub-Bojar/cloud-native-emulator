@@ -43,3 +43,21 @@ spec:
     - port: http
       path: /metrics
       interval: 5s
+---
+# The controller exposes emulator_configured_rtt_ms on /metrics — the
+# template's configured inter-tier latency, so dashboards can show "what the
+# latency is meant to be" next to the workers' measured worker_peer_rtt_ms.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: emulator-controller
+  labels:
+    release: kps
+spec:
+  selector:
+    matchLabels:
+      app: controller
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

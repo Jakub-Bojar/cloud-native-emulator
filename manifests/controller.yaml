@@ -75,6 +75,30 @@ roleRef:
   name: controller-emulator
   apiGroup: rbac.authorization.k8s.io
 ---
+# Nodes are cluster-scoped: chaos.py reads their tier labels to map worker
+# pods to tiers when checking template-defined latency coverage.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: controller-emulator-nodes
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: controller-emulator-nodes
+subjects:
+  - kind: ServiceAccount
+    name: controller-sa
+    namespace: cloud-native-emulator
+roleRef:
+  kind: ClusterRole
+  name: controller-emulator-nodes
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -109,7 +133,10 @@ spec:
           image: jp36/emulator-controller:latest
           imagePullPolicy: Always
           ports:
-            - containerPort: 8081
+            # Named so the PodMonitor in monitoring.yaml can scrape /metrics
+            # (the configured inter-tier RTT) by port name.
+            - name: http
+              containerPort: 8081
           env:
             # Site identity — this controller's place in the larger cloud system.
             # Every observability response carries {id, tier} so a future

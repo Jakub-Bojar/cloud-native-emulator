@@ -1,5 +1,13 @@
 # Inter-tier network latency via Chaos Mesh (replaces the old hand-rolled
-# tc-netem DaemonSet). Each NetworkChaos selects emulator pods by the TIER
+# tc-netem DaemonSet).
+#
+# NOTE: the preferred way to declare latency is now the template's own
+# `latency` field (e.g. {"latency": {"edge": {"cloud": "100ms"}}}) — the
+# controller renders, reconciles, and tears down the NetworkChaos for you
+# (see controller/chaos.py). This manifest remains for driving the chaos by
+# hand; don't use both at once or the delays stack.
+#
+# Each NetworkChaos selects emulator pods by the TIER
 # NODE LABEL of the node they run on, and delays traffic to/from pods of the
 # peer tier. `direction: both` applies the latency on egress at each end, so
 # RTT between two tiers = 2 x latency:

@@ -26,15 +26,21 @@
 # {
 #   "name": "frontend-backend",
 #   "x": 50,
+#   "latency": {
+#     "edge": { "fog": "10ms", "cloud": "100ms" },
+#     "fog":  { "cloud": "40ms" }
+#   },
 #   "roles": {
 #     "frontend": {
 #       "count": 1,
+#       "tier": "edge",
 #       "cpu": {"a": 20, "b": 200},
 #       "ram": {"a": 8,  "b": 128},
 #       "net": {"a": 0.5, "b": 5}
 #     },
 #     "backend": {
 #       "count": 3,
+#       "tier": "cloud",
 #       "cpu": {"a": 5, "b": 50},
 #       "ram": {"a": 2, "b": 32},
 #       "net": {"a": 0.1, "b": 1}
@@ -49,6 +55,12 @@
 # Service of `to`. So `frontend -> backend` with backend.count = 3 is a
 # 1-to-many fan-out (k8s Service round-robins TCP connects across backend
 # pods). A many-to-many mesh is expressed as multiple edges.
+#
+# `tier` (optional, per role) pins the role's pods to nodes labelled
+# `tier=<value>`. `latency` (optional) declares the round-trip time between
+# tier pairs; the controller turns each pair into a Chaos Mesh NetworkChaos
+# (half the RTT per direction), keeps them re-resolved across pod churn, and
+# deletes them on teardown — see controller/chaos.py and API.md.
 # ============================================================================
 ---
 apiVersion: v1
