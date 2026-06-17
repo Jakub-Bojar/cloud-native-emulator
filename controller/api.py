@@ -1,5 +1,5 @@
 """
-Unified /api/v1 surface: query + control, in clean JSON.
+Unified api surface: query + control, in clean JSON.
 
 This is the per-VM "site API". One controller runs per VM, and each VM plays
 a role in a larger cloud system (edge / fog / cloud). Every response carries
