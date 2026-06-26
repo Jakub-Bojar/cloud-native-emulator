@@ -1,0 +1,111 @@
+{
+  "schema_version": "1.0",
+  "name": "streaming-analytics",
+  "sites": [
+    {
+      "site_id": "site_edge_01",
+      "tier_id": "tier_1",
+      "tier_name": "edge",
+      "capacity": { "cpu_vcpu": 2, "memory_gib": 2 },
+      "provision": { "node_count": 1 }
+    },
+    {
+      "site_id": "site_stream_01",
+      "tier_id": "tier_2",
+      "tier_name": "stream",
+      "capacity": { "cpu_vcpu": 4, "memory_gib": 8 },
+      "provision": { "node_count": 1 }
+    },
+    {
+      "site_id": "site_cloud_01",
+      "tier_id": "tier_3",
+      "tier_name": "cloud",
+      "capacity": { "cpu_vcpu": 4, "memory_gib": 8 },
+      "provision": { "node_count": 1 }
+    }
+  ],
+  "network_links": [
+    {
+      "link_id": "link_edge_stream",
+      "source_site_id": "site_edge_01",
+      "target_site_id": "site_stream_01",
+      "one_way_ms": 15,
+      "bandwidth_mbps": 1000
+    },
+    {
+      "link_id": "link_stream_cloud",
+      "source_site_id": "site_stream_01",
+      "target_site_id": "site_cloud_01",
+      "one_way_ms": 40,
+      "bandwidth_mbps": 10000
+    }
+  ],
+  "apps": [
+    {
+      "app_id": "app_web_events",
+      "app": { "app_name": "web-events", "app_type": "event_producer", "deployment_ref": "dep_web_events" },
+      "sla": { "max_rtt_ms": 50, "bandwidth_mbps_per_user": 2 },
+      "load": { "cpu": { "a": 1, "b": 15 }, "ram": { "a": 0.1, "b": 48 }, "net": { "a": 0.3, "b": 2 } }
+    },
+    {
+      "app_id": "app_mobile_events",
+      "app": { "app_name": "mobile-events", "app_type": "event_producer", "deployment_ref": "dep_mobile_events" },
+      "sla": { "max_rtt_ms": 50, "bandwidth_mbps_per_user": 2 },
+      "load": { "cpu": { "a": 1, "b": 15 }, "ram": { "a": 0.1, "b": 48 }, "net": { "a": 0.3, "b": 2 } }
+    },
+    {
+      "app_id": "app_iot_events",
+      "app": { "app_name": "iot-events", "app_type": "event_producer", "deployment_ref": "dep_iot_events" },
+      "sla": { "max_rtt_ms": 80, "bandwidth_mbps_per_user": 1 },
+      "load": { "cpu": { "a": 0.5, "b": 10 }, "ram": { "a": 0.1, "b": 32 }, "net": { "a": 0.2, "b": 1 } }
+    },
+    {
+      "app_id": "app_broker",
+      "app": { "app_name": "kafka-broker", "app_type": "message_broker", "deployment_ref": "dep_broker" },
+      "sla": { "max_rtt_ms": 100, "bandwidth_mbps_per_user": 5 },
+      "load": { "cpu": { "a": 2, "b": 60 }, "ram": { "a": 0.5, "b": 256 }, "net": { "a": 0.5, "b": 5 } }
+    },
+    {
+      "app_id": "app_processor",
+      "app": { "app_name": "stream-processor", "app_type": "stream_processing", "deployment_ref": "dep_processor" },
+      "sla": { "max_rtt_ms": 150, "bandwidth_mbps_per_user": 4 },
+      "load": { "cpu": { "a": 4, "b": 80 }, "ram": { "a": 0.8, "b": 384 }, "net": { "a": 0.3, "b": 3 } }
+    },
+    {
+      "app_id": "app_warehouse",
+      "app": { "app_name": "data-warehouse", "app_type": "storage", "deployment_ref": "dep_warehouse" },
+      "sla": { "max_rtt_ms": 400, "bandwidth_mbps_per_user": 0 },
+      "load": { "cpu": { "a": 1, "b": 40 }, "ram": { "a": 2, "b": 512 }, "net": { "a": 0, "b": 0 } }
+    },
+    {
+      "app_id": "app_dashboard",
+      "app": { "app_name": "realtime-dashboard", "app_type": "analytics", "deployment_ref": "dep_dashboard" },
+      "sla": { "max_rtt_ms": 200, "bandwidth_mbps_per_user": 1 },
+      "load": { "cpu": { "a": 1, "b": 30 }, "ram": { "a": 0.3, "b": 128 }, "net": { "a": 0, "b": 0 } }
+    }
+  ],
+  "app_edges": [
+    { "edge_id": "e1", "source_app_id": "app_web_events",    "target_app_id": "app_broker" },
+    { "edge_id": "e2", "source_app_id": "app_mobile_events", "target_app_id": "app_broker" },
+    { "edge_id": "e3", "source_app_id": "app_iot_events",    "target_app_id": "app_broker" },
+    { "edge_id": "e4", "source_app_id": "app_broker",        "target_app_id": "app_processor" },
+    { "edge_id": "e5", "source_app_id": "app_processor",     "target_app_id": "app_warehouse" },
+    { "edge_id": "e6", "source_app_id": "app_processor",     "target_app_id": "app_dashboard" }
+  ],
+  "k8s_app_description": [
+    { "deployment_id": "dep_web_events",    "deployment_name": "web-events",         "namespace": "streaming-analytics", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_mobile_events", "deployment_name": "mobile-events",      "namespace": "streaming-analytics", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_iot_events",    "deployment_name": "iot-events",         "namespace": "streaming-analytics", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_broker",        "deployment_name": "kafka-broker",       "namespace": "streaming-analytics", "replicas": 1, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_processor",     "deployment_name": "stream-processor",   "namespace": "streaming-analytics", "replicas": 2, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_warehouse",     "deployment_name": "data-warehouse",     "namespace": "streaming-analytics", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } },
+    { "deployment_id": "dep_dashboard",     "deployment_name": "realtime-dashboard", "namespace": "streaming-analytics", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } }
+  ],
+  "runtime_scenarios": [
+    { "phase_id": "idle",         "start_min": 0,  "end_min": 5,  "x": { "app_web_events": 5,   "app_mobile_events": 3,   "app_iot_events": 10 } },
+    { "phase_id": "ramp",         "start_min": 5,  "end_min": 15, "x": { "app_web_events": 60,  "app_mobile_events": 40,  "app_iot_events": 15 } },
+    { "phase_id": "web_spike",    "start_min": 15, "end_min": 25, "x": { "app_web_events": 120, "app_mobile_events": 50,  "app_iot_events": 15 } },
+    { "phase_id": "mobile_spike", "start_min": 25, "end_min": 35, "x": { "app_web_events": 50,  "app_mobile_events": 100, "app_iot_events": 15 } },
+    { "phase_id": "settle",       "start_min": 35, "end_min": 50, "x": { "app_web_events": 20,  "app_mobile_events": 15,  "app_iot_events": 12 } }
+  ]
+}

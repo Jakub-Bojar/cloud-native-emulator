@@ -1,0 +1,110 @@
+{
+  "schema_version": "1.0",
+  "name": "dual-pipeline",
+  "sites": [
+    {
+      "site_id": "site_edge_01",
+      "tier_id": "tier_1",
+      "tier_name": "edge",
+      "capacity": { "cpu_vcpu": 2, "memory_gib": 2 },
+      "provision": { "node_count": 1 }
+    },
+    {
+      "site_id": "site_fog_01",
+      "tier_id": "tier_2",
+      "tier_name": "fog",
+      "capacity": { "cpu_vcpu": 2, "memory_gib": 4 },
+      "provision": { "node_count": 1 }
+    },
+    {
+      "site_id": "site_cloud_01",
+      "tier_id": "tier_3",
+      "tier_name": "cloud",
+      "capacity": { "cpu_vcpu": 4, "memory_gib": 8 },
+      "provision": { "node_count": 1 }
+    }
+  ],
+  "network_links": [
+    {
+      "link_id": "link_edge_fog",
+      "source_site_id": "site_edge_01",
+      "target_site_id": "site_fog_01",
+      "one_way_ms": 10,
+      "bandwidth_mbps": 1000
+    },
+    {
+      "link_id": "link_fog_cloud",
+      "source_site_id": "site_fog_01",
+      "target_site_id": "site_cloud_01",
+      "one_way_ms": 50,
+      "bandwidth_mbps": 5000
+    }
+  ],
+  "apps": [
+    {
+      "app_id": "app_sensor",
+      "app": { "app_name": "iot_sensor", "app_type": "data_collection", "deployment_ref": "dep_sensor" },
+      "sla": { "max_rtt_ms": 20, "bandwidth_mbps_per_user": 2 },
+      "load": { "cpu": { "a": 1, "b": 30 }, "ram": { "a": 0.1, "b": 24 }, "net": { "a": 0.1, "b": 1 } }
+    },
+    {
+      "app_id": "app_gateway",
+      "app": { "app_name": "iot_gateway", "app_type": "event_aggregation", "deployment_ref": "dep_gateway" },
+      "sla": { "max_rtt_ms": 60, "bandwidth_mbps_per_user": 3 },
+      "load": { "cpu": { "a": 2, "b": 50 }, "ram": { "a": 0.3, "b": 48 }, "net": { "a": 0.2, "b": 2 } }
+    },
+    {
+      "app_id": "app_ingest",
+      "app": { "app_name": "iot_ingest", "app_type": "stream_processing", "deployment_ref": "dep_ingest" },
+      "sla": { "max_rtt_ms": 150, "bandwidth_mbps_per_user": 2 },
+      "load": { "cpu": { "a": 2, "b": 55 }, "ram": { "a": 0.5, "b": 64 }, "net": { "a": 0.1, "b": 1 } }
+    },
+    {
+      "app_id": "app_camera",
+      "app": { "app_name": "video_camera", "app_type": "data_collection", "deployment_ref": "dep_camera" },
+      "sla": { "max_rtt_ms": 50, "bandwidth_mbps_per_user": 10 },
+      "load": { "cpu": { "a": 1, "b": 15 }, "ram": { "a": 0.1, "b": 32 }, "net": { "a": 0.5, "b": 8 } }
+    },
+    {
+      "app_id": "app_analyzer",
+      "app": { "app_name": "video_analyzer", "app_type": "compute", "deployment_ref": "dep_analyzer" },
+      "sla": { "max_rtt_ms": 100, "bandwidth_mbps_per_user": 5 },
+      "load": { "cpu": { "a": 5, "b": 85 }, "ram": { "a": 1, "b": 192 }, "net": { "a": 0.3, "b": 5 } }
+    },
+    {
+      "app_id": "app_fusion",
+      "app": { "app_name": "data_fusion", "app_type": "compute", "deployment_ref": "dep_fusion" },
+      "sla": { "max_rtt_ms": 120, "bandwidth_mbps_per_user": 4 },
+      "load": { "cpu": { "a": 3, "b": 75 }, "ram": { "a": 1, "b": 160 }, "net": { "a": 0.4, "b": 6 } }
+    },
+    {
+      "app_id": "app_store",
+      "app": { "app_name": "unified_store", "app_type": "storage", "deployment_ref": "dep_store" },
+      "sla": { "max_rtt_ms": 300, "bandwidth_mbps_per_user": 0 },
+      "load": { "cpu": { "a": 1, "b": 40 }, "ram": { "a": 2, "b": 512 }, "net": { "a": 0, "b": 0 } }
+    }
+  ],
+  "app_edges": [
+    { "edge_id": "e_a1", "source_app_id": "app_sensor",   "target_app_id": "app_gateway" },
+    { "edge_id": "e_a2", "source_app_id": "app_gateway",  "target_app_id": "app_ingest" },
+    { "edge_id": "e_a3", "source_app_id": "app_ingest",   "target_app_id": "app_fusion" },
+    { "edge_id": "e_b1", "source_app_id": "app_camera",   "target_app_id": "app_analyzer" },
+    { "edge_id": "e_b2", "source_app_id": "app_analyzer", "target_app_id": "app_fusion" },
+    { "edge_id": "e_join", "source_app_id": "app_fusion", "target_app_id": "app_store" }
+  ],
+  "k8s_app_description": [
+    { "deployment_id": "dep_sensor",   "deployment_name": "iot-sensor",      "namespace": "dual-pipeline", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_gateway",  "deployment_name": "iot-gateway",     "namespace": "dual-pipeline", "replicas": 1, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_ingest",   "deployment_name": "iot-ingest",      "namespace": "dual-pipeline", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } },
+    { "deployment_id": "dep_camera",   "deployment_name": "video-camera",    "namespace": "dual-pipeline", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_analyzer", "deployment_name": "video-analyzer",  "namespace": "dual-pipeline", "replicas": 2, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_fusion",   "deployment_name": "data-fusion",     "namespace": "dual-pipeline", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } },
+    { "deployment_id": "dep_store",    "deployment_name": "unified-store",   "namespace": "dual-pipeline", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } }
+  ],
+  "runtime_scenarios": [
+    { "phase_id": "idle",   "start_min": 0,  "end_min": 5,  "x": { "app_sensor": 5,   "app_camera": 3  } },
+    { "phase_id": "ramp",   "start_min": 5,  "end_min": 15, "x": { "app_sensor": 70,  "app_camera": 40 } },
+    { "phase_id": "burst",  "start_min": 15, "end_min": 25, "x": { "app_sensor": 100, "app_camera": 60 } },
+    { "phase_id": "settle", "start_min": 25, "end_min": 40, "x": { "app_sensor": 20,  "app_camera": 15 } }
+  ]
+}

@@ -1,0 +1,102 @@
+{
+  "schema_version": "1.0",
+  "name": "cdn-live-video",
+  "sites": [
+    {
+      "site_id": "site_origin_01",
+      "tier_id": "tier_1",
+      "tier_name": "origin",
+      "capacity": { "cpu_vcpu": 8, "memory_gib": 8 },
+      "provision": { "node_count": 1 }
+    },
+    {
+      "site_id": "site_edge_01",
+      "tier_id": "tier_2",
+      "tier_name": "edge",
+      "capacity": { "cpu_vcpu": 4, "memory_gib": 8 },
+      "provision": { "node_count": 1 }
+    },
+    {
+      "site_id": "site_viewer_01",
+      "tier_id": "tier_3",
+      "tier_name": "viewer",
+      "capacity": { "cpu_vcpu": 2, "memory_gib": 2 },
+      "provision": { "node_count": 1 }
+    }
+  ],
+  "network_links": [
+    {
+      "link_id": "link_origin_edge",
+      "source_site_id": "site_origin_01",
+      "target_site_id": "site_edge_01",
+      "one_way_ms": 20,
+      "bandwidth_mbps": 2000
+    },
+    {
+      "link_id": "link_edge_viewer",
+      "source_site_id": "site_edge_01",
+      "target_site_id": "site_viewer_01",
+      "one_way_ms": 30,
+      "bandwidth_mbps": 1000
+    }
+  ],
+  "apps": [
+    {
+      "app_id": "app_camera_a",
+      "app": { "app_name": "camera-channel-a", "app_type": "video_ingest", "deployment_ref": "dep_camera_a" },
+      "sla": { "max_rtt_ms": 60, "bandwidth_mbps_per_user": 12 },
+      "load": { "cpu": { "a": 1, "b": 25 }, "ram": { "a": 0.1, "b": 64 }, "net": { "a": 0.5, "b": 8 } }
+    },
+    {
+      "app_id": "app_camera_b",
+      "app": { "app_name": "camera-channel-b", "app_type": "video_ingest", "deployment_ref": "dep_camera_b" },
+      "sla": { "max_rtt_ms": 60, "bandwidth_mbps_per_user": 12 },
+      "load": { "cpu": { "a": 1, "b": 25 }, "ram": { "a": 0.1, "b": 64 }, "net": { "a": 0.5, "b": 8 } }
+    },
+    {
+      "app_id": "app_transcoder",
+      "app": { "app_name": "transcoder", "app_type": "compute", "deployment_ref": "dep_transcoder" },
+      "sla": { "max_rtt_ms": 120, "bandwidth_mbps_per_user": 8 },
+      "load": { "cpu": { "a": 6, "b": 120 }, "ram": { "a": 0.5, "b": 256 }, "net": { "a": 0.4, "b": 6 } }
+    },
+    {
+      "app_id": "app_packager",
+      "app": { "app_name": "hls-packager", "app_type": "compute", "deployment_ref": "dep_packager" },
+      "sla": { "max_rtt_ms": 150, "bandwidth_mbps_per_user": 6 },
+      "load": { "cpu": { "a": 2, "b": 50 }, "ram": { "a": 0.3, "b": 128 }, "net": { "a": 0.4, "b": 5 } }
+    },
+    {
+      "app_id": "app_edge_cache",
+      "app": { "app_name": "edge-cache", "app_type": "cache", "deployment_ref": "dep_edge_cache" },
+      "sla": { "max_rtt_ms": 100, "bandwidth_mbps_per_user": 6 },
+      "load": { "cpu": { "a": 1, "b": 40 }, "ram": { "a": 1, "b": 512 }, "net": { "a": 0.5, "b": 6 } }
+    },
+    {
+      "app_id": "app_player",
+      "app": { "app_name": "video-player", "app_type": "client", "deployment_ref": "dep_player" },
+      "sla": { "max_rtt_ms": 200, "bandwidth_mbps_per_user": 0 },
+      "load": { "cpu": { "a": 0.5, "b": 20 }, "ram": { "a": 0.1, "b": 48 }, "net": { "a": 0, "b": 0 } }
+    }
+  ],
+  "app_edges": [
+    { "edge_id": "e1", "source_app_id": "app_camera_a",  "target_app_id": "app_transcoder" },
+    { "edge_id": "e2", "source_app_id": "app_camera_b",  "target_app_id": "app_transcoder" },
+    { "edge_id": "e3", "source_app_id": "app_transcoder", "target_app_id": "app_packager" },
+    { "edge_id": "e4", "source_app_id": "app_packager",   "target_app_id": "app_edge_cache" },
+    { "edge_id": "e5", "source_app_id": "app_edge_cache", "target_app_id": "app_player" }
+  ],
+  "k8s_app_description": [
+    { "deployment_id": "dep_camera_a",   "deployment_name": "camera-channel-a", "namespace": "cdn-live-video", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_camera_b",   "deployment_name": "camera-channel-b", "namespace": "cdn-live-video", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_transcoder", "deployment_name": "transcoder",       "namespace": "cdn-live-video", "replicas": 2, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_packager",   "deployment_name": "hls-packager",     "namespace": "cdn-live-video", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_edge_cache", "deployment_name": "edge-cache",       "namespace": "cdn-live-video", "replicas": 2, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_player",     "deployment_name": "video-player",     "namespace": "cdn-live-video", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } }
+  ],
+  "runtime_scenarios": [
+    { "phase_id": "preshow",         "start_min": 0,  "end_min": 10, "x": { "app_camera_a": 5,  "app_camera_b": 5  } },
+    { "phase_id": "channel_a_live",  "start_min": 10, "end_min": 25, "x": { "app_camera_a": 80, "app_camera_b": 10 } },
+    { "phase_id": "both_live",       "start_min": 25, "end_min": 40, "x": { "app_camera_a": 80, "app_camera_b": 60 } },
+    { "phase_id": "channel_b_only",  "start_min": 40, "end_min": 55, "x": { "app_camera_a": 5,  "app_camera_b": 90 } }
+  ]
+}

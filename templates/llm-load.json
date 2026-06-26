@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "name": "llm-load",
+  "x": 10,
+  "sites": [
+    {
+      "site_id": "site_llm_01",
+      "tier_id": "tier_1",
+      "tier_name": "llm",
+      "capacity": { "cpu_vcpu": 2, "memory_gib": 8 },
+      "provision": { "node_count": 1 }
+    }
+  ],
+  "network_links": [],
+  "apps": [
+    {
+      "app_id": "app_llm",
+      "app": { "app_name": "llm", "app_type": "model_inference", "deployment_ref": "deployment_llm" },
+      "load": { "cpu": { "a": 13.69, "b": 68.45 }, "ram": { "a": 4.3425, "b": 5537.55 }, "net": { "a": 0.0004, "b": 0.0 } }
+    }
+  ],
+  "app_edges": [],
+  "k8s_app_description": [
+    { "deployment_id": "deployment_llm", "deployment_name": "llm", "namespace": "llm-load", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } }
+  ]
+}

@@ -1,0 +1,172 @@
+{
+  "schema_version": "1.0",
+  "name": "iot-topology",
+  "sites": [
+    {
+      "site_id": "site_edge_01",
+      "tier_id": "tier_1",
+      "tier_name": "edge",
+      "capacity": {
+        "cpu_vcpu": 1,
+        "memory_gib": 2
+      }
+    },
+    {
+      "site_id": "site_fog_01",
+      "tier_id": "tier_2",
+      "tier_name": "fog",
+      "capacity": {
+        "cpu_vcpu": 2,
+        "memory_gib": 2
+      }
+    },
+    {
+      "site_id": "site_cloud_01",
+      "tier_id": "tier_3",
+      "tier_name": "cloud",
+      "capacity": {
+        "cpu_vcpu": 2,
+        "memory_gib": 3
+      }
+    }
+  ],
+  "network_links": [
+    {
+      "link_id": "link_edge_to_fog",
+      "source_site_id": "site_edge_01",
+      "target_site_id": "site_fog_01",
+      "one_way_ms": 10,
+      "bandwidth_mbps": 1000
+    },
+    {
+      "link_id": "link_fog_to_cloud",
+      "source_site_id": "site_fog_01",
+      "target_site_id": "site_cloud_01",
+      "one_way_ms": 50,
+      "bandwidth_mbps": 5000
+    },
+    {
+      "link_id": "link_edge_to_cloud",
+      "source_site_id": "site_edge_01",
+      "target_site_id": "site_cloud_01",
+      "one_way_ms": 120,
+      "bandwidth_mbps": 500
+    }
+  ],
+  "apps": [
+    {
+      "app_id": "app_sensor",
+      "app": {
+        "app_name": "sensor_stream",
+        "app_type": "data_collection",
+        "deployment_ref": "deployment_sensor"
+      },
+      "sla": {
+        "max_rtt_ms": 20,
+        "bandwidth_mbps_per_user": 3
+      },
+      "load": {
+        "cpu": { "a": 1, "b": 20 },
+        "ram": { "a": 0.2, "b": 32 },
+        "net": { "a": 0.1, "b": 0.5 }
+      }
+    },
+    {
+      "app_id": "app_gateway",
+      "app": {
+        "app_name": "fog_gateway",
+        "app_type": "event_aggregation",
+        "deployment_ref": "deployment_gateway"
+      },
+      "sla": {
+        "max_rtt_ms": 50,
+        "bandwidth_mbps_per_user": 5
+      },
+      "load": {
+        "cpu": { "a": 2, "b": 30 },
+        "ram": { "a": 0.5, "b": 64 },
+        "net": { "a": 0.2, "b": 1 }
+      }
+    },
+    {
+      "app_id": "app_ingest",
+      "app": {
+        "app_name": "cloud_ingest",
+        "app_type": "stream_processing",
+        "deployment_ref": "deployment_ingest"
+      },
+      "sla": {
+        "max_rtt_ms": 150,
+        "bandwidth_mbps_per_user": 3
+      },
+      "load": {
+        "cpu": { "a": 3, "b": 40 },
+        "ram": { "a": 1, "b": 96 },
+        "net": { "a": 0.1, "b": 1 }
+      }
+    },
+    {
+      "app_id": "app_db",
+      "app": {
+        "app_name": "cloud_database",
+        "app_type": "storage",
+        "deployment_ref": "deployment_db"
+      },
+      "sla": {
+        "max_rtt_ms": 200,
+        "bandwidth_mbps_per_user": 0
+      },
+      "load": {
+        "cpu": { "a": 0, "b": 40 },
+        "ram": { "a": 0, "b": 256 },
+        "net": { "a": 0, "b": 0 }
+      }
+    }
+  ],
+  "app_edges": [
+    { "edge_id": "edge_sensor_to_gateway", "source_app_id": "app_sensor",  "target_app_id": "app_gateway" },
+    { "edge_id": "edge_gateway_to_ingest", "source_app_id": "app_gateway", "target_app_id": "app_ingest" },
+    { "edge_id": "edge_ingest_to_db",      "source_app_id": "app_ingest",  "target_app_id": "app_db" }
+  ],
+  "k8s_app_description": [
+    {
+      "deployment_id": "deployment_sensor",
+      "deployment_name": "sensor-daemon",
+      "namespace": "iot-topology",
+            "replicas": 1,
+      "node_selector": {
+        "topology.tier_id": "tier_1"
+      }
+    },
+    {
+      "deployment_id": "deployment_gateway",
+      "deployment_name": "gateway-aggregator",
+      "namespace": "iot-topology",
+            "replicas": 1,
+      "node_selector": {
+        "topology.tier_id": "tier_2"
+      }
+    },
+    {
+      "deployment_id": "deployment_ingest",
+      "deployment_name": "cloud-ingest-service",
+      "namespace": "iot-topology",
+            "replicas": 1,
+      "node_selector": {
+        "topology.tier_id": "tier_3"
+      }
+    },
+    {
+      "deployment_id": "deployment_db",
+      "deployment_name": "timeseries-db",
+      "namespace": "iot-topology",
+            "replicas": 1,
+      "node_selector": {
+        "topology.tier_id": "tier_3"
+      }
+    }
+  ],
+  "runtime_scenarios": [
+
+  ]
+}

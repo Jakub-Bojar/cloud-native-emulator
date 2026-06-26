@@ -1,0 +1,93 @@
+{
+  "model": "llama3.2:3b",
+  "x": [
+    0,
+    1,
+    2,
+    4,
+    8
+  ],
+  "rows": [
+    {
+      "x": 0,
+      "cpu_millicores": 3.4,
+      "ram_mb": 5517.8,
+      "net_mbps": 0.0,
+      "tokens_per_s": 0.0,
+      "requests": 0,
+      "failed_rate": 0.0,
+      "latency_ms": 0.0
+    },
+    {
+      "x": 1,
+      "cpu_millicores": 121.8,
+      "ram_mb": 5556.4,
+      "net_mbps": 0.0024,
+      "tokens_per_s": 34.4,
+      "requests": 7,
+      "failed_rate": 0,
+      "latency_ms": 5806.7
+    },
+    {
+      "x": 2,
+      "cpu_millicores": 122.9,
+      "ram_mb": 5557.4,
+      "net_mbps": 0.003,
+      "tokens_per_s": 43.7,
+      "requests": 10,
+      "failed_rate": 0,
+      "latency_ms": 9152.7
+    },
+    {
+      "x": 4,
+      "cpu_millicores": 143.3,
+      "ram_mb": 5552.3,
+      "net_mbps": 0.0037,
+      "tokens_per_s": 53.5,
+      "requests": 12,
+      "failed_rate": 0,
+      "latency_ms": 14959.4
+    },
+    {
+      "x": 8,
+      "cpu_millicores": 156.2,
+      "ram_mb": 5569.0,
+      "net_mbps": 0.0041,
+      "tokens_per_s": 59.5,
+      "requests": 16,
+      "failed_rate": 0,
+      "latency_ms": 26830.3
+    }
+  ],
+  "fits": {
+    "cpu": {
+      "a": 13.69,
+      "b": 68.45,
+      "r2": 0.5027
+    },
+    "ram": {
+      "a": 4.3425,
+      "b": 5537.55,
+      "r2": 0.5038
+    },
+    "net": {
+      "a": 0.0004,
+      "b": 0.0,
+      "r2": 0.6458
+    }
+  },
+  "load": {
+    "cpu": {
+      "a": 13.69,
+      "b": 68.45
+    },
+    "ram": {
+      "a": 4.3425,
+      "b": 5537.55
+    },
+    "net": {
+      "a": 0.0004,
+      "b": 0.0
+    }
+  }
+}

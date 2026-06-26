@@ -1,0 +1,121 @@
+{
+  "schema_version": "1.0",
+  "name": "microservices-shop",
+  "sites": [
+    {
+      "site_id": "site_edge_01",
+      "tier_id": "tier_1",
+      "tier_name": "edge",
+      "capacity": { "cpu_vcpu": 2, "memory_gib": 2 },
+      "provision": { "node_count": 1 }
+    },
+    {
+      "site_id": "site_app_01",
+      "tier_id": "tier_2",
+      "tier_name": "app",
+      "capacity": { "cpu_vcpu": 4, "memory_gib": 8 },
+      "provision": { "node_count": 1 }
+    },
+    {
+      "site_id": "site_data_01",
+      "tier_id": "tier_3",
+      "tier_name": "data",
+      "capacity": { "cpu_vcpu": 4, "memory_gib": 8 },
+      "provision": { "node_count": 1 }
+    }
+  ],
+  "network_links": [
+    {
+      "link_id": "link_edge_app",
+      "source_site_id": "site_edge_01",
+      "target_site_id": "site_app_01",
+      "one_way_ms": 5,
+      "bandwidth_mbps": 1000
+    },
+    {
+      "link_id": "link_app_data",
+      "source_site_id": "site_app_01",
+      "target_site_id": "site_data_01",
+      "one_way_ms": 2,
+      "bandwidth_mbps": 5000
+    }
+  ],
+  "apps": [
+    {
+      "app_id": "app_storefront",
+      "app": { "app_name": "store-front", "app_type": "web_frontend", "deployment_ref": "dep_storefront" },
+      "sla": { "max_rtt_ms": 50, "bandwidth_mbps_per_user": 2 },
+      "load": { "cpu": { "a": 1, "b": 20 }, "ram": { "a": 0.1, "b": 64 }, "net": { "a": 0.4, "b": 5 } }
+    },
+    {
+      "app_id": "app_gateway",
+      "app": { "app_name": "api-gateway", "app_type": "api_gateway", "deployment_ref": "dep_gateway" },
+      "sla": { "max_rtt_ms": 40, "bandwidth_mbps_per_user": 3 },
+      "load": { "cpu": { "a": 2, "b": 40 }, "ram": { "a": 0.2, "b": 96 }, "net": { "a": 0.3, "b": 3 } }
+    },
+    {
+      "app_id": "app_auth",
+      "app": { "app_name": "auth-svc", "app_type": "service", "deployment_ref": "dep_auth" },
+      "sla": { "max_rtt_ms": 60, "bandwidth_mbps_per_user": 1 },
+      "load": { "cpu": { "a": 1, "b": 30 }, "ram": { "a": 0.1, "b": 64 }, "net": { "a": 0.1, "b": 1 } }
+    },
+    {
+      "app_id": "app_catalog",
+      "app": { "app_name": "catalog-svc", "app_type": "service", "deployment_ref": "dep_catalog" },
+      "sla": { "max_rtt_ms": 80, "bandwidth_mbps_per_user": 2 },
+      "load": { "cpu": { "a": 2, "b": 35 }, "ram": { "a": 0.3, "b": 128 }, "net": { "a": 0.2, "b": 2 } }
+    },
+    {
+      "app_id": "app_cart",
+      "app": { "app_name": "cart-svc", "app_type": "service", "deployment_ref": "dep_cart" },
+      "sla": { "max_rtt_ms": 80, "bandwidth_mbps_per_user": 1 },
+      "load": { "cpu": { "a": 1.5, "b": 30 }, "ram": { "a": 0.2, "b": 96 }, "net": { "a": 0.15, "b": 1 } }
+    },
+    {
+      "app_id": "app_orders",
+      "app": { "app_name": "orders-svc", "app_type": "service", "deployment_ref": "dep_orders" },
+      "sla": { "max_rtt_ms": 120, "bandwidth_mbps_per_user": 2 },
+      "load": { "cpu": { "a": 2, "b": 40 }, "ram": { "a": 0.2, "b": 96 }, "net": { "a": 0.15, "b": 2 } }
+    },
+    {
+      "app_id": "app_postgres",
+      "app": { "app_name": "postgres", "app_type": "database", "deployment_ref": "dep_postgres" },
+      "sla": { "max_rtt_ms": 200, "bandwidth_mbps_per_user": 0 },
+      "load": { "cpu": { "a": 1, "b": 50 }, "ram": { "a": 1, "b": 512 }, "net": { "a": 0, "b": 0 } }
+    },
+    {
+      "app_id": "app_redis",
+      "app": { "app_name": "redis-cache", "app_type": "cache", "deployment_ref": "dep_redis" },
+      "sla": { "max_rtt_ms": 100, "bandwidth_mbps_per_user": 0 },
+      "load": { "cpu": { "a": 0.5, "b": 25 }, "ram": { "a": 0.5, "b": 256 }, "net": { "a": 0, "b": 0 } }
+    }
+  ],
+  "app_edges": [
+    { "edge_id": "e1",  "source_app_id": "app_storefront", "target_app_id": "app_gateway" },
+    { "edge_id": "e2",  "source_app_id": "app_gateway",    "target_app_id": "app_auth" },
+    { "edge_id": "e3",  "source_app_id": "app_gateway",    "target_app_id": "app_catalog" },
+    { "edge_id": "e4",  "source_app_id": "app_gateway",    "target_app_id": "app_cart" },
+    { "edge_id": "e5",  "source_app_id": "app_gateway",    "target_app_id": "app_orders" },
+    { "edge_id": "e6",  "source_app_id": "app_catalog",    "target_app_id": "app_redis" },
+    { "edge_id": "e7",  "source_app_id": "app_cart",       "target_app_id": "app_redis" },
+    { "edge_id": "e8",  "source_app_id": "app_auth",       "target_app_id": "app_postgres" },
+    { "edge_id": "e9",  "source_app_id": "app_catalog",    "target_app_id": "app_postgres" },
+    { "edge_id": "e10", "source_app_id": "app_orders",     "target_app_id": "app_postgres" }
+  ],
+  "k8s_app_description": [
+    { "deployment_id": "dep_storefront", "deployment_name": "store-front",  "namespace": "microservices-shop", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "dep_gateway",    "deployment_name": "api-gateway",  "namespace": "microservices-shop", "replicas": 2, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_auth",       "deployment_name": "auth-svc",     "namespace": "microservices-shop", "replicas": 1, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_catalog",    "deployment_name": "catalog-svc",  "namespace": "microservices-shop", "replicas": 2, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_cart",       "deployment_name": "cart-svc",     "namespace": "microservices-shop", "replicas": 1, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_orders",     "deployment_name": "orders-svc",   "namespace": "microservices-shop", "replicas": 1, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "dep_postgres",   "deployment_name": "postgres",     "namespace": "microservices-shop", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } },
+    { "deployment_id": "dep_redis",      "deployment_name": "redis-cache",  "namespace": "microservices-shop", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } }
+  ],
+  "runtime_scenarios": [
+    { "phase_id": "quiet",   "start_min": 0,  "end_min": 5,  "x": 10  },
+    { "phase_id": "ramp",    "start_min": 5,  "end_min": 15, "x": 50  },
+    { "phase_id": "peak",    "start_min": 15, "end_min": 30, "x": 120 },
+    { "phase_id": "evening", "start_min": 30, "end_min": 45, "x": 40  }
+  ]
+}

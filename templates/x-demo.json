@@ -1,0 +1,58 @@
+{
+  "schema_version": "1.0",
+  "name": "x-demo",
+  "sites": [
+    {
+      "site_id": "site_demo_01",
+      "tier_id": "tier_1",
+      "tier_name": "demo",
+      "capacity": { "cpu_vcpu": 2, "memory_gib": 2 },
+      "provision": { "node_count": 1 }
+    }
+  ],
+  "network_links": [],
+  "apps": [
+    {
+      "app_id": "app_ingest_a",
+      "app": { "app_name": "ingest_a", "app_type": "source", "deployment_ref": "deployment_ingest_a" },
+      "load": { "cpu": { "a": 3, "b": 90 }, "ram": { "a": 0.2, "b": 50 }, "net": { "a": 0.5, "b": 3 } }
+    },
+    {
+      "app_id": "app_proc_a",
+      "app": { "app_name": "processor_a", "app_type": "compute", "deployment_ref": "deployment_proc_a" },
+      "load": { "cpu": { "a": 3, "b": 80 }, "ram": { "a": 0.3, "b": 60 }, "net": { "a": 0.3, "b": 2 } }
+    },
+    {
+      "app_id": "app_store_a",
+      "app": { "app_name": "store_a", "app_type": "sink", "deployment_ref": "deployment_store_a" },
+      "load": { "cpu": { "a": 1, "b": 70 }, "ram": { "a": 0.4, "b": 90 }, "net": { "a": 0, "b": 0 } }
+    },
+    {
+      "app_id": "app_ingest_b",
+      "app": { "app_name": "ingest_b", "app_type": "source", "deployment_ref": "deployment_ingest_b" },
+      "load": { "cpu": { "a": 3, "b": 90 }, "ram": { "a": 0.2, "b": 50 }, "net": { "a": 0.5, "b": 3 } }
+    },
+    {
+      "app_id": "app_store_b",
+      "app": { "app_name": "store_b", "app_type": "sink", "deployment_ref": "deployment_store_b" },
+      "load": { "cpu": { "a": 1, "b": 70 }, "ram": { "a": 0.4, "b": 90 }, "net": { "a": 0, "b": 0 } }
+    }
+  ],
+  "app_edges": [
+    { "edge_id": "e_a1", "source_app_id": "app_ingest_a", "target_app_id": "app_proc_a" },
+    { "edge_id": "e_a2", "source_app_id": "app_proc_a",   "target_app_id": "app_store_a" },
+    { "edge_id": "e_b1", "source_app_id": "app_ingest_b", "target_app_id": "app_store_b" }
+  ],
+  "k8s_app_description": [
+    { "deployment_id": "deployment_ingest_a", "deployment_name": "ingest-a",     "namespace": "x-demo", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "deployment_proc_a",   "deployment_name": "processor-a",  "namespace": "x-demo", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "deployment_store_a",  "deployment_name": "store-a",      "namespace": "x-demo", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "deployment_ingest_b", "deployment_name": "ingest-b",     "namespace": "x-demo", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "deployment_store_b",  "deployment_name": "store-b",      "namespace": "x-demo", "replicas": 1, "node_selector": { "topology.tier_id": "tier_1" } }
+  ],
+  "runtime_scenarios": [
+    { "phase_id": "warmup", "start_min": 0,  "end_min": 5,  "x": 10 },
+    { "phase_id": "busy",   "start_min": 5,  "end_min": 15, "x": 40 },
+    { "phase_id": "quiet",  "start_min": 15, "end_min": 25, "x": 10 }
+  ]
+}

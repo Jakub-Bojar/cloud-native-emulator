@@ -1,0 +1,25 @@
+# Lets the in-cluster Prometheus scrape the host-run controller's /metrics
+# (the "configured inter-tier RTT" reference panel). Only needed because, off
+# the cluster, the controller is no longer covered by the PodMonitor.
+#
+# Set HOST_IP to your Mac's address as seen FROM the cluster VMs (find it with:
+#   multipass exec microk8s-vm -- ip route | awk '/default/{print $3}'
+# or use the multipass gateway). Then:
+#   multipass exec microk8s-vm -- microk8s kubectl apply -f - < manifests/host-controller-scrape.yaml
+#
+# Requires the ScrapeConfig CRD (kube-prometheus-stack ships it in recent
+# versions). The actual measured RTT (worker_peer_rtt_ms) still comes from the
+# worker PodMonitor, which is unaffected — this only restores the reference line.
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: host-controller
+  namespace: monitoring
+  labels:
+    release: kps           # match your kube-prometheus-stack release label
+spec:
+  staticConfigs:
+    - targets:
+        - "HOST_IP:8081"   # <-- replace HOST_IP with the Mac's cluster-facing address
+  metricsPath: /metrics
+  scrapeInterval: 15s

@@ -1,0 +1,275 @@
+{
+  "uid": "emulator-network",
+  "title": "Emulator — Network",
+  "description": "Inter-tier network behaviour per node-to-node link: latency (configured one-way delay vs measured one-way latency) and bandwidth (measured throughput per link). Latency values are one-way (the measured TCP round-trip halved, since the inject is symmetric) so they line up with the configured one-way delay; throughput is the measured iperf3 egress summed across the source role's pods.",
+  "tags": ["emulator", "network", "latency", "bandwidth"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-30m", "to": "now" },
+  "schemaVersion": 39,
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Datasource",
+        "hide": 0,
+        "current": {},
+        "options": [],
+        "refresh": 1
+      },
+      {
+        "name": "base_ms",
+        "type": "textbox",
+        "label": "Base one-way RTT to subtract (ms)",
+        "description": "Unshaped network latency between nodes, subtracted from the measured value so the latency panels track the configured inject. ~half the node-to-node round-trip base (≈3ms here). Set 0 to see the raw measurement.",
+        "query": "3",
+        "current": { "text": "3", "value": "3" },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Latency",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Configured latency between nodes",
+      "description": "One-way latency configured in the template for each tier pair (e.g. edge -> fog = 10ms means 10ms A→B and 10ms B→A). Updates immediately on PATCH.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 0,
+          "color": { "mode": "fixed", "fixedColor": "blue" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 150 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "justifyMode": "center",
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "emulator_configured_one_way_ms",
+          "legendFormat": "{{pair}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Measured one-way latency between nodes — min / avg / max (selected period)",
+      "description": "One row per node-to-node link (source tier → destination tier), averaged across the source pods, over the selected time range — one-way (the measured TCP round-trip halved; valid because the injected delay is symmetric). Min ≈ the configured one-way delay — compare it directly against the configured panel above. Avg/Max sit higher because the netem timer slips under VM scheduling jitter and queuing, so they overstate the true link delay. The unshaped base RTT is subtracted via the `base_ms` control at the top (set it to 0 to see the raw measurement); any remainder above the configured value is real queuing under load.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 1,
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" } }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Min" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "color", "value": { "mode": "thresholds" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 50 },
+                    { "color": "red", "value": 150 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [{ "displayName": "Field", "desc": false }]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(avg by (role, peer_name) (worker_peer_rtt_ms / 2) - $base_ms, 0)",
+          "legendFormat": "{{role}} → {{peer_name}}",
+          "format": "time_series",
+          "instant": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "reduce",
+          "options": {
+            "mode": "seriesToRows",
+            "reducers": ["min", "mean", "max"]
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "One-way latency between nodes (time series)",
+      "description": "Measured one-way latency for each node-to-node link (source tier → destination tier), averaged across the source pods, over the selected time range — set the range with the dashboard time picker (top-right) to see the last X minutes. TCP round-trip halved, probed every 15s; tracks the injected link delay (tc netem) plus real network jitter. The unshaped base RTT is subtracted via the `base_ms` control at the top (set it to 0 for the raw measurement).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "custom": { "lineWidth": 2, "fillOpacity": 8, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean", "min", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(avg by (role, peer_name) (worker_peer_rtt_ms / 2) - $base_ms, 0)",
+          "legendFormat": "{{role}} → {{peer_name}}"
+        }
+      ]
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Bandwidth",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 28 }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Configured bandwidth between nodes",
+      "description": "Bandwidth cap configured in the template for each tier pair (e.g. edge -> fog = 1000mbps means the tc rate limit applied on the link in each direction). Updates immediately on PATCH. The throughput panels below should sit at or under these caps.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 29 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "decimals": 0,
+          "color": { "mode": "fixed", "fixedColor": "blue" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "blue", "value": null }]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "justifyMode": "center",
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "emulator_configured_bandwidth_mbps * 1000000",
+          "legendFormat": "{{pair}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Throughput between nodes (time series)",
+      "description": "Measured egress throughput for each node-to-node link (source tier → destination tier), summed across the source role's pods, from worker_peer_egress_mbps (parsed from the iperf3 client's per-second interval reports). This is the actual traffic crossing the link; compare it against the configured bandwidth cap above (which tc enforces on the tier node's NIC). Values are converted to bits/sec so Grafana auto-scales to Mb/s.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "min": 0,
+          "custom": { "lineWidth": 2, "fillOpacity": 8, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean", "min", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (role, peer_name) (worker_peer_egress_mbps) * 1000000",
+          "legendFormat": "{{role}} → {{peer_name}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Measured throughput between nodes — min / avg / max (selected period)",
+      "description": "One row per node-to-node link (source tier → destination tier), summed across the source role's pods, over the selected time range. Avg is the steady-state throughput on the link; Max approaches the configured `bandwidth` cap when the link saturates. Values are bits/sec (auto-scaled to Mb/s).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 47 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "decimals": 2,
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" } }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [{ "displayName": "Field", "desc": false }]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (role, peer_name) (worker_peer_egress_mbps) * 1000000",
+          "legendFormat": "{{role}} → {{peer_name}}",
+          "format": "time_series",
+          "instant": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "reduce",
+          "options": {
+            "mode": "seriesToRows",
+            "reducers": ["min", "mean", "max"]
+          }
+        }
+      ]
+    }
+  ]
+}

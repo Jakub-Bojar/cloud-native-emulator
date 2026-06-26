@@ -1,0 +1,61 @@
+# Helm values overlay for the kube-prometheus-stack ("kps") release.
+#
+# Fixes the "Grafana dies / forgets everything when nodes are deleted" problem
+# by moving the monitoring stack off the emulator's ephemeral worker nodes and
+# onto the persistent control-plane node, and giving Grafana durable storage.
+#
+# Apply with manifests/setup-monitoring.sh (or by hand):
+#   microk8s helm3 upgrade kps prometheus-community/kube-prometheus-stack \
+#     -n monitoring --reuse-values --version 86.2.0 -f manifests/monitoring-values.yaml
+
+grafana:
+  # Survive pod restarts/reschedules (dashboards, password, sessions persist).
+  persistence:
+    enabled: true
+    storageClassName: microk8s-hostpath
+    size: 2Gi
+  # Live on the persistent control-plane node, never on emulator worker nodes.
+  nodeSelector:
+    kubernetes.io/hostname: microk8s-vm
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: control-plane
+      effect: NoSchedule
+  # The sidecar auto-loads any ConfigMap labelled grafana_dashboard=1 in this
+  # namespace (already enabled by the chart; pinned here for clarity).
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+
+  # Infinity datasource plugin — the Topology DAG dashboard
+  # (grafana/grafana-nodegraph.json) reads the controller's GET /graph through it.
+  plugins:
+    - yesoreyeram-infinity-datasource
+
+  # Provisioned so the URL survives helm upgrades. Editing it in the Grafana UI
+  # does NOT stick — the kps datasource sidecar reasserts this value, so the UI
+  # change reverts on the next reconcile/restart. `url` is the host-run
+  # controller as seen FROM the cluster VMs (the Mac's cluster-facing IP, == the
+  # VM default gateway). ENVIRONMENT-SPECIFIC: update it if the multipass/cluster
+  # network changes — find it with:
+  #   multipass exec microk8s-vm -- ip route | awk '/default/{print $3}'
+  # access: proxy means the Grafana *server* fetches it, so it must be reachable
+  # from the Grafana pod (localhost there is the pod, not your Mac).
+  additionalDataSources:
+    - name: Infinity
+      type: yesoreyeram-infinity-datasource
+      access: proxy
+      isDefault: false
+      url: http://192.168.2.1:8081
+      jsonData:
+        allowedHosts:
+          - http://192.168.2.1:8081
+        tlsSkipVerify: true
+
+# NOTE: Prometheus is intentionally NOT pinned to microk8s-vm — it's RAM-hungry
+# and the 1.9 GiB control-plane node would OOM. If you bump microk8s-vm's memory
+# (e.g. 4 GiB) you can pin it too with the same nodeSelector + toleration. For
+# now only Grafana (light, ~250 MiB) moves to the persistent node; if Prometheus
+# briefly reschedules on a node delete it just re-scrapes — Grafana stays up.

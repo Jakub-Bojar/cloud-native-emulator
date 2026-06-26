@@ -1,0 +1,92 @@
+{
+  "schema_version": "1.0",
+  "name": "multi-vm-mesh",
+  "sites": [
+    {
+      "site_id": "site_edge_01",
+      "tier_id": "tier_1",
+      "tier_name": "edge",
+      "capacity": { "cpu_vcpu": 1, "memory_gib": 2 },
+      "provision": { "node_count": 2 }
+    },
+    {
+      "site_id": "site_fog_01",
+      "tier_id": "tier_2",
+      "tier_name": "fog",
+      "capacity": { "cpu_vcpu": 2, "memory_gib": 2 },
+      "provision": { "node_count": 2 }
+    },
+    {
+      "site_id": "site_cloud_01",
+      "tier_id": "tier_3",
+      "tier_name": "cloud",
+      "capacity": { "cpu_vcpu": 2, "memory_gib": 3 },
+      "provision": { "node_count": 1 }
+    }
+  ],
+  "network_links": [
+    { "link_id": "link_edge_to_fog",   "source_site_id": "site_edge_01", "target_site_id": "site_fog_01",   "one_way_ms": 15,  "bandwidth_mbps": 1000 },
+    { "link_id": "link_fog_to_cloud",  "source_site_id": "site_fog_01",  "target_site_id": "site_cloud_01", "one_way_ms": 40,  "bandwidth_mbps": 2000 },
+    { "link_id": "link_edge_to_cloud", "source_site_id": "site_edge_01", "target_site_id": "site_cloud_01", "one_way_ms": 100, "bandwidth_mbps": 500 }
+  ],
+  "apps": [
+    {
+      "app_id": "app_sensor_temp",
+      "app": { "app_name": "telemetry_temp", "app_type": "data_collection", "deployment_ref": "deployment_sensor_temp" },
+      "sla": { "max_rtt_ms": 25, "bandwidth_mbps_per_user": 2 },
+      "load": { "cpu": { "a": 0.5, "b": 15 }, "ram": { "a": 0.1, "b": 24 }, "net": { "a": 0.2, "b": 1 } }
+    },
+    {
+      "app_id": "app_sensor_video",
+      "app": { "app_name": "telemetry_video", "app_type": "data_collection", "deployment_ref": "deployment_sensor_video" },
+      "sla": { "max_rtt_ms": 40, "bandwidth_mbps_per_user": 8 },
+      "load": { "cpu": { "a": 1, "b": 25 }, "ram": { "a": 0.3, "b": 48 }, "net": { "a": 0.6, "b": 3 } }
+    },
+    {
+      "app_id": "app_gateway",
+      "app": { "app_name": "fog_gateway", "app_type": "event_aggregation", "deployment_ref": "deployment_gateway" },
+      "sla": { "max_rtt_ms": 60, "bandwidth_mbps_per_user": 6 },
+      "load": { "cpu": { "a": 1.5, "b": 30 }, "ram": { "a": 0.4, "b": 64 }, "net": { "a": 0.3, "b": 2 } }
+    },
+    {
+      "app_id": "app_ingest",
+      "app": { "app_name": "cloud_ingest", "app_type": "stream_processing", "deployment_ref": "deployment_ingest" },
+      "sla": { "max_rtt_ms": 150, "bandwidth_mbps_per_user": 4 },
+      "load": { "cpu": { "a": 2, "b": 50 }, "ram": { "a": 1, "b": 96 }, "net": { "a": 0.15, "b": 2 } }
+    },
+    {
+      "app_id": "app_analytics",
+      "app": { "app_name": "cloud_analytics", "app_type": "batch_compute", "deployment_ref": "deployment_analytics" },
+      "sla": { "max_rtt_ms": 200, "bandwidth_mbps_per_user": 1 },
+      "load": { "cpu": { "a": 2, "b": 60 }, "ram": { "a": 1.5, "b": 128 }, "net": { "a": 0.05, "b": 1 } }
+    },
+    {
+      "app_id": "app_db",
+      "app": { "app_name": "timeseries_store", "app_type": "storage", "deployment_ref": "deployment_db" },
+      "sla": { "max_rtt_ms": 250, "bandwidth_mbps_per_user": 0 },
+      "load": { "cpu": { "a": 0.5, "b": 40 }, "ram": { "a": 0.2, "b": 256 }, "net": { "a": 0, "b": 0 } }
+    }
+  ],
+  "app_edges": [
+    { "edge_id": "e_temp_to_gateway",      "source_app_id": "app_sensor_temp",  "target_app_id": "app_gateway" },
+    { "edge_id": "e_video_to_gateway",     "source_app_id": "app_sensor_video", "target_app_id": "app_gateway" },
+    { "edge_id": "e_gateway_to_ingest",    "source_app_id": "app_gateway",      "target_app_id": "app_ingest" },
+    { "edge_id": "e_ingest_to_analytics",  "source_app_id": "app_ingest",       "target_app_id": "app_analytics" },
+    { "edge_id": "e_ingest_to_db",         "source_app_id": "app_ingest",       "target_app_id": "app_db" },
+    { "edge_id": "e_analytics_to_db",      "source_app_id": "app_analytics",    "target_app_id": "app_db" }
+  ],
+  "k8s_app_description": [
+    { "deployment_id": "deployment_sensor_temp",  "deployment_name": "sensor-temp",     "namespace": "multi-vm-mesh", "replicas": 2, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "deployment_sensor_video", "deployment_name": "sensor-video",    "namespace": "multi-vm-mesh", "replicas": 2, "node_selector": { "topology.tier_id": "tier_1" } },
+    { "deployment_id": "deployment_gateway",      "deployment_name": "fog-gateway",     "namespace": "multi-vm-mesh", "replicas": 2, "node_selector": { "topology.tier_id": "tier_2" } },
+    { "deployment_id": "deployment_ingest",       "deployment_name": "cloud-ingest",    "namespace": "multi-vm-mesh", "replicas": 2, "node_selector": { "topology.tier_id": "tier_3" } },
+    { "deployment_id": "deployment_analytics",    "deployment_name": "cloud-analytics", "namespace": "multi-vm-mesh", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } },
+    { "deployment_id": "deployment_db",           "deployment_name": "timeseries-db",   "namespace": "multi-vm-mesh", "replicas": 1, "node_selector": { "topology.tier_id": "tier_3" } }
+  ],
+  "runtime_scenarios": [
+    { "phase_id": "warmup",   "start_min": 0,  "end_min": 5,  "x": 10 },
+    { "phase_id": "ramp",     "start_min": 5,  "end_min": 15, "x": 50 },
+    { "phase_id": "peak",     "start_min": 15, "end_min": 22, "x": 100 },
+    { "phase_id": "cooldown", "start_min": 22, "end_min": 30, "x": 30 }
+  ]
+}
