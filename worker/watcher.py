@@ -47,6 +47,9 @@ def _validate(payload: dict) -> None:
     peers = payload.get("peers")
     if peers is not None and not isinstance(peers, list):
         raise ValueError("peers must be a list of strings if present")
+    peer_names = payload.get("peer_names")
+    if peer_names is not None and not isinstance(peer_names, dict):
+        raise ValueError("peer_names must be an object {ip: role} if present")
 
 
 def _load_and_apply(path: str, callback: ConfigCallback) -> None:

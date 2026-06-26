@@ -60,18 +60,21 @@ STRESS_CPU = Gauge("worker_cpu_stress_millicores",
                    "worker_target_cpu_millicores. Watch it move after a "
                    "reconfigure to see the loop working.")
 
+# `peer` is the bare pod IP (keeps each series unique); `peer_name` is the
+# destination role that IP belongs to, supplied by the controller, for a
+# readable dashboard legend. peer_name falls back to the IP when unmapped.
 PEER_EGRESS = Gauge("worker_peer_egress_mbps",
                     "Measured egress to a specific peer IP (Mbps), parsed from "
                     "the iperf3 client's per-second interval reports. One "
                     "series per peer IP this pod is sending to.",
-                    ["peer"])
+                    ["peer", "peer_name"])
 
 PEER_RTT = Gauge("worker_peer_rtt_ms",
                  "TCP-handshake round-trip time to a peer pod (ms), probed "
                  "against the peer's HTTP port every 15s. Measured pod-to-pod, "
                  "so it includes injected inter-tier latency (Chaos Mesh / tc "
                  "netem). One series per peer IP this pod sends to.",
-                 ["peer"])
+                 ["peer", "peer_name"])
 
 
 _CGROUP_PATHS: tuple[str, str, str] | None = None
@@ -227,11 +230,12 @@ def sampler_loop(interval: float = 1.0) -> None:
     HEARTBEAT_INTERVAL_S = 30.0
     RTT_PROBE_INTERVAL_S = 15.0
 
-    # Peer IPs we currently have a worker_peer_egress_mbps series for, so we
-    # can remove series for peers that vanish after a reconfigure.
-    published_peers: set[str] = set()
+    # Peers we currently have a worker_peer_egress_mbps series for, as
+    # {ip: peer_name}, so we can remove (with both label values) series for
+    # peers that vanish after a reconfigure.
+    published_peers: dict[str, str] = {}
     # Same bookkeeping for the worker_peer_rtt_ms series.
-    published_rtt_peers: set[str] = set()
+    published_rtt_peers: dict[str, str] = {}
 
     # Cgroup CPU is averaged over a rolling 15s window so the gauge
     # matches what kubectl top (and the Grafana dashboard's rate()[1m])
@@ -347,17 +351,22 @@ def sampler_loop(interval: float = 1.0) -> None:
             ACTUAL_NET.set(mbps)
 
             # Publish measured per-peer egress and prune series for peers that
-            # disappeared (e.g. after a reconfigure changed the peer set).
+            # disappeared (e.g. after a reconfigure changed the peer set). The
+            # peer_name label is the destination role (falls back to the IP).
+            with STATE_LOCK:
+                peer_names = dict(STATE.get("peer_names") or {})
             with PEER_EGRESS_LOCK:
                 peer_snapshot = dict(PEER_EGRESS_MBPS)
             for peer_ip, peer_mbps in peer_snapshot.items():
-                PEER_EGRESS.labels(peer=peer_ip).set(peer_mbps)
-            for stale in published_peers - peer_snapshot.keys():
+                name = peer_names.get(peer_ip, peer_ip)
+                PEER_EGRESS.labels(peer=peer_ip, peer_name=name).set(peer_mbps)
+            for stale in published_peers.keys() - peer_snapshot.keys():
                 try:
-                    PEER_EGRESS.remove(stale)
+                    PEER_EGRESS.remove(stale, published_peers[stale])
                 except KeyError:
                     pass
-            published_peers = set(peer_snapshot.keys())
+            published_peers = {ip: peer_names.get(ip, ip)
+                               for ip in peer_snapshot}
 
             # Probe per-peer RTT. Blocking, so on its own slow cadence with a
             # 1s timeout — worst case (every peer down) stalls one sampler
@@ -366,15 +375,18 @@ def sampler_loop(interval: float = 1.0) -> None:
                 last_rtt_probe = now
                 with STATE_LOCK:
                     rtt_peers = list(STATE.get("peers") or [])
+                    rtt_names = dict(STATE.get("peer_names") or {})
                 for ip in rtt_peers:
                     ms = _probe_rtt_ms(ip)
                     if ms is not None:
-                        PEER_RTT.labels(peer=ip).set(ms)
-                for stale in published_rtt_peers - set(rtt_peers):
+                        name = rtt_names.get(ip, ip)
+                        PEER_RTT.labels(peer=ip, peer_name=name).set(ms)
+                for stale in published_rtt_peers.keys() - set(rtt_peers):
                     try:
-                        PEER_RTT.remove(stale)
+                        PEER_RTT.remove(stale, published_rtt_peers[stale])
                     except KeyError:
                         pass
-                published_rtt_peers = set(rtt_peers)
+                published_rtt_peers = {ip: rtt_names.get(ip, ip)
+                                       for ip in rtt_peers}
         except Exception:
             log.exception("sampler iteration failed; continuing")

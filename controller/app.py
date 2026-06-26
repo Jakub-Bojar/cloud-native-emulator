@@ -29,7 +29,7 @@ POST   /template           materialise the posted template. Re-POSTing the
                            different template is already materialised
 GET    /template           the materialised template, in full (404 if none)
 PATCH  /template           partial update — merge, re-resolve, re-materialise.
-                           Change anything: x, a role's cpu/ram/net/count/tier,
+                           Change anything: x, a role's cpu/ram/net/count/tier/node,
                            edges, or inter-tier latency. Accepts nested JSON or
                            dot-path shorthand, e.g. {"x": 80,
                            "latency.edge.cloud": "150ms"}
@@ -45,8 +45,8 @@ GET    /overview               site-wide snapshot; subsumes the old /health
 GET    /measurements/now       fused k8s + live worker metrics, instantaneous
 GET    /measurements/range     CPU/RAM/net aggregated between ?start and ?end
                                (ISO 8601 or unix; default: the last 15 min)
-GET    /measurements/periods   the same range split into consecutive
-                               ?chunk-sized periods, each aggregated separately
+GET    /measurements/periods   the last ?count chunks of ?chunk each, ending
+                               now, each aggregated separately
 
 Interactive docs (generated from the code, no hand-maintained spec):
 GET    /docs   and   GET /openapi.json
@@ -54,6 +54,8 @@ GET    /docs   and   GET /openapi.json
 
 import logging
 import os
+import shutil
+import sys
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -61,15 +63,22 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 
 import api
-import chaos
 import graph
+import linkspec
 import materialiser
-import watcher
+import runner
+
+# Provisioning is merged into the controller: when it runs on the host it can
+# drive Multipass itself, so POST /template provisions the sites' VMs before
+# materialising the apps. provision.py lives one dir up under provision/.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "provision"))
+import provision  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,6 +91,11 @@ log = logging.getLogger(__name__)
 # to a specific origin to lock it down.
 CORS_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")
 
+# When the controller runs on the host (off-cluster), POST /template provisions
+# the sites' VMs via Multipass before materialising the apps.
+CONTROL_PLANE_VM = os.environ.get("CONTROL_PLANE_VM", "microk8s-vm")
+NODE_IMAGE = os.environ.get("NODE_IMAGE", "22.04")
+
 
 # ── Write lock ──────────────────────────────────────────────────────────────
 # Endpoints run concurrently in the threadpool, so two writes could
@@ -92,11 +106,6 @@ _write_lock = threading.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Declarative ingestion: poll labelled ConfigMaps and reconcile them
-    # via the same materialiser used by POST /templates. Same daemon thread
-    # the old controller started in main(). Keep the server at ONE process
-    # (uvicorn --workers 1) so only one reconciler runs.
-    watcher.start()
     log.info("Controller started")
     yield
 
@@ -126,6 +135,13 @@ _DARK_CSS = """<style>
   .swagger-ui { filter: invert(88%) hue-rotate(180deg); }
   .swagger-ui .microlight { filter: invert(100%) hue-rotate(180deg); }
 </style>"""
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    # There's no content at the root; send browsers straight to the API docs so
+    # hitting the bare host:port doesn't 404 with {"detail":"Not Found"}.
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/docs", include_in_schema=False)
@@ -170,7 +186,14 @@ class Role(BaseModel):
     cpu: Axis
     ram: Axis
     net: Axis
-    tier: str | None = None
+    tier: str | None = Field(
+        None, description="Pin pods to nodes labelled tier=<value> "
+                          "(e.g. edge/fog/cloud). Absent = schedule anywhere.")
+    node: str | None = Field(
+        None, description="Pin pods to one specific node by name (its "
+                          "kubernetes.io/hostname). Must be a node of `tier` "
+                          "if both set. Empty string unpins. PATCH this to "
+                          "move a deployment between nodes.")
 
 
 class Edge(BaseModel):
@@ -187,12 +210,14 @@ class Template(BaseModel):
     edges: list[Edge] = []
     latency: dict[str, dict[str, str]] | None = Field(
         None,
-        description="Optional inter-tier round-trip times, e.g. "
-                    '{"edge": {"fog": "30ms", "cloud": "120ms"}}. Each pair '
-                    "is rendered into a Chaos Mesh NetworkChaos (half the "
-                    "RTT injected per direction), reconciled across pod "
-                    "churn, and removed on DELETE. Pairs are symmetric — "
-                    "specify each once. Requires Chaos Mesh.",
+        description="Optional inter-tier ONE-WAY latency, e.g. "
+                    '{"edge": {"fog": "30ms", "cloud": "120ms"}} means a '
+                    "packet takes 30ms edge→fog (and 30ms back — symmetric). "
+                    "Applied as link-level tc shaping on the tier nodes "
+                    "(injects the full value on each direction), so pods "
+                    "inherit it and scaling never disturbs it; reconciled each "
+                    "materialise and removed on DELETE. Pairs are symmetric — "
+                    "specify each once.",
         examples=[{"edge": {"fog": "30ms", "cloud": "120ms"},
                    "fog": {"cloud": "60ms"}}],
     )
@@ -209,9 +234,8 @@ def _stamp(payload: dict) -> dict:
 # ── The template: singular CRUD ──────────────────────────────────────────────
 def _single_template_name() -> str:
     """Name of the one materialised template. 404 if none. 409 if the cluster
-    somehow holds more than one (e.g. legacy state from the old plural API, or
-    several labelled ConfigMaps picked up by the watcher) — surfacing that
-    beats silently picking one."""
+    somehow holds more than one (e.g. legacy state from the old plural API) —
+    surfacing that beats silently picking one."""
     names = materialiser.list_managed()
     if not names:
         raise HTTPException(404, "no template materialised")
@@ -231,14 +255,67 @@ def get_template():
 
 
 @app.post("/template", status_code=201)
-def create_template(template: Template):
-    body = template.model_dump(by_alias=True)
-    # GET /template responses carry an injected `timestamp`; strip it here so
-    # re-POSTing a GET round-trips cleanly instead of storing the stamp as
-    # template content (extra="allow" would otherwise keep it).
+def create_template(payload: dict):
+    """Materialise a posted template.
+
+    Two schemas are accepted, distinguished by the `schema_version` field:
+
+    - Present → the new topology schema (`sites`, `network_links`, `apps`,
+      `app_edges`, `k8s_app_description`, `runtime_scenarios`). The controller
+      validates it,
+      confirms the tier nodes the apps need already exist (it does NOT
+      provision them — that's the host-side `provision.py`), then materialises
+      each app's cpu/ram/net load from its `apps[].load` block (idle when it has
+      none). The signal `x` comes from the first `runtime_scenarios` phase (else
+      the doc baseline, default 0) and propagates down the role graph. A phase's
+      `x` is either a number (system-wide — every DAG starts together) or an
+      object keyed by DAG source app_id (per-DAG — each pipeline starts at its
+      own input). Later phases are time windows the scenario runner steps
+      through. Pins each app to its tier via the `topology.tier_id` node label.
+
+    - Absent → the legacy role/edge schema (`name`, `x`, `roles`, `edges`,
+      `latency`), materialised exactly as before.
+
+    Re-POSTing the same name re-materialises idempotently; 409 if a *different*
+    template is already materialised.
+    """
+    # GET responses carry an injected `timestamp`; strip it so re-POSTing a GET
+    # round-trips cleanly instead of storing the stamp as template content.
+    payload.pop("timestamp", None)
+
+    # ── New topology schema ──────────────────────────────────────────────
+    if payload.get("schema_version"):
+        materialiser.validate_topology(payload)
+        with _write_lock:
+            name = materialiser.topology_name(payload)
+            existing = materialiser.list_managed()
+            if existing and existing != [name]:
+                raise HTTPException(
+                    409, f"template {existing[0]!r} is already materialised; "
+                         "DELETE it before posting a new one")
+            # 1. Provision the sites' VMs — only when running on a host with
+            #    Multipass. Off a host, skip and rely on pre-provisioned nodes;
+            #    materialise_topology's check_sites validates they exist.
+            provisioned = None
+            if shutil.which("multipass"):
+                log.info("Provisioning sites for topology %s", name)
+                provisioned = provision.up(payload,
+                                           control_plane=CONTROL_PLANE_VM,
+                                           image=NODE_IMAGE)
+            # 2. Materialise the apps at baseline (check_sites runs first).
+            log.info("Materialising topology %s", name)
+            report = materialiser.materialise_topology(payload)
+        # 3. Start the scenario runner if the topology declares phases.
+        runner.start(payload, name)
+        if provisioned is not None:
+            report = {"provision": provisioned, **report}
+        return _stamp(report)
+
+    # ── Legacy role/edge schema ──────────────────────────────────────────
+    body = Template(**payload).model_dump(by_alias=True)
     body.pop("timestamp", None)
     # Cycle detection + edge-endpoint checks beyond Pydantic's shape check.
-    materialiser.validate(body)
+    materialiser.validate_template(body)
     with _write_lock:
         # Singleton invariant: re-POSTing the same name re-materialises
         # idempotently; a different name while one exists is a conflict.
@@ -278,30 +355,51 @@ def delete_template():
     # _single_template_name 404s when nothing is materialised, so "deleted
     # nothing because it was already gone" stays distinguishable from a real
     # teardown; resolving it under the lock keeps check-then-delete atomic.
+    #
+    # Symmetric with POST: tears down the apps + link shaping AND, for a
+    # topology, strips the infrastructure too — drains/deletes the nodes the
+    # provisioner created for it (found by marker label) and deletes their VMs.
     with _write_lock:
         name = _single_template_name()
+        topo = materialiser.get_topology_doc(name)
+        node_names = materialiser.topology_node_names(topo) if topo else []
+        runner.stop()
         log.info("Tearing down template %s", name)
         deleted = materialiser.teardown(name)
-    return _stamp({"name": name, "deleted": deleted})
+        deprovisioned = None
+        if node_names and shutil.which("multipass"):
+            log.info("Stripping %d node(s) for %s: %s",
+                     len(node_names), name, ", ".join(node_names))
+            deprovisioned = provision.down_nodes(node_names,
+                                                 control_plane=CONTROL_PLANE_VM)
+    out = {"name": name, "deleted": deleted}
+    if deprovisioned is not None:
+        out["deprovisioned"] = deprovisioned
+    return _stamp(out)
 
 
 # ── Graph ─────────────────────────────────────────────────────────────────────
 @app.get("/metrics", include_in_schema=False)
 def metrics() -> Response:
-    # Publish the materialised template's CONFIGURED inter-tier RTTs for
-    # Prometheus (the dashboard's "what latency is meant to be" panel).
-    # Recomputed each scrape from the live template, so a PATCH retune shows
-    # up at once; cleared when there's no template or no latency field.
-    pairs: dict = {}
+    # Publish the materialised template's CONFIGURED inter-tier latency AND
+    # bandwidth for Prometheus (the dashboard's "what it's meant to be" panels).
+    # Recomputed each scrape from the live template, so a PATCH retune shows up
+    # at once; cleared when there's no template or no latency/bandwidth field.
+    rtt_pairs: dict = {}
+    bw_pairs: dict = {}
     names = materialiser.list_managed()
     if names:
-        info = materialiser.get_managed(names[0])
-        latency = ((info or {}).get("template") or {}).get("latency")
+        template = (materialiser.get_managed(names[0]) or {}).get("template") or {}
         try:
-            pairs = chaos.validate_latency(latency)
+            rtt_pairs = linkspec.validate_latency(template.get("latency"))
         except ValueError:
-            pairs = {}
-    chaos.set_configured_rtt(pairs)
+            rtt_pairs = {}
+        try:
+            bw_pairs = linkspec.validate_bandwidth(template.get("bandwidth"))
+        except ValueError:
+            bw_pairs = {}
+    linkspec.set_configured_rtt(rtt_pairs)
+    linkspec.set_configured_bw(bw_pairs)
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
@@ -382,23 +480,18 @@ def measurements_range(
 
 @app.get("/measurements/periods")
 def measurements_periods(
-    start: datetime | None = Query(
-        None,
-        description="Range start — same formats and defaults as "
-                    "`/measurements/range`.",
-        examples=["2026-06-10T11:00:00"],
-    ),
-    end: datetime | None = Query(
-        None,
-        description="Range end, same formats as `start`. Defaults to now.",
-        examples=["2026-06-10T12:00:00"],
+    count: int = Query(
+        ...,
+        ge=1,
+        description="How many chunks to return, counting back from now. e.g. "
+                    "`?count=4&chunk=11m` → the last 44 minutes as 4 "
+                    "eleven-minute periods.",
+        examples=[4],
     ),
     chunk: str = Query(
         ...,
         description="Length of each chunk — e.g. `90s`, `10m`, `1h` (min "
-                    "`30s`, the scrape interval). The range is split into as "
-                    "many FULL chunks as fit; a trailing remainder is "
-                    "dropped and reported as `remainder_s`.",
+                    "`30s`, the scrape interval).",
         examples=["10m"],
     ),
     resources: str | None = Query(
@@ -408,16 +501,17 @@ def measurements_periods(
         examples=["cpu,net"],
     ),
 ):
-    """The range split into consecutive `chunk`-sized periods, each
-    aggregated separately.
+    """The last `count` chunks of `chunk` each, ending now, aggregated
+    separately.
 
-    e.g. `?start=11:00&end=12:00&chunk=10m` → 6 ten-minute periods, each with
-    the same totals/roles/x blocks as `/measurements/range`."""
+    e.g. `?count=4&chunk=11m` → the last 44 minutes as 4 eleven-minute
+    periods. Each period carries the same totals/roles/x blocks as
+    `/measurements/range`."""
     res = ([r.strip() for r in resources.split(",") if r.strip()]
            if resources else None)
-    # template_periods raises ValueError on bad chunking/resources/interval (→400).
-    data = api.template_periods(_single_template_name(), start=start, end=end,
-                                chunk=chunk, resources=res)
+    # template_periods raises ValueError on a bad chunk/count/resources (→400).
+    data = api.template_periods(_single_template_name(),
+                                chunk=chunk, count=count, resources=res)
     if data is None:
         raise HTTPException(404, "no template materialised")
     return _stamp(data)

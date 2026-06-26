@@ -152,6 +152,18 @@ spec:
               value: "15"
             - name: CPU_TOLERANCE_MC
               value: "5"
+            # UDP datagram size for the iperf3 net generator (`-l`). iperf3's
+            # small default (~1460 B) means thousands of sendmsg() calls/sec at
+            # higher rates, and that per-call cost — not the byte volume — is
+            # what dominates a net-heavy pod's CPU. Bigger datagrams move the
+            # same Mbps in far fewer calls, cutting the CPU "floor" that makes
+            # actual CPU overshoot a low target. The kernel IP-fragments over-MTU
+            # datagrams, so link shaping (tc/netem) is unaffected. Stay under the
+            # 65507 B UDP max; set "" or "0" for iperf3's default. If a shaped
+            # link's measured net starts undershooting after this, lower it (e.g.
+            # 8K) — no rebuild needed, just edit here and re-POST.
+            - name: IPERF_UDP_LEN
+              value: "32K"
           ports:
             # HTTP control / status / Prometheus metrics.
             - { name: http,   containerPort: 8080 }

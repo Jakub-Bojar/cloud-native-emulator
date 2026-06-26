@@ -70,6 +70,15 @@ def configure(payload: dict) -> None:
         raw_peers = None
     peers = raw_peers or []
 
+    # Map of peer IP → destination role name, used only to label per-peer
+    # metrics with a readable name. Optional; unmapped IPs fall back to the IP.
+    raw_peer_names = payload.get("peer_names")
+    if raw_peer_names is not None and not isinstance(raw_peer_names, dict):
+        log.warning("peer_names field is not a dict, ignoring: %r",
+                    raw_peer_names)
+        raw_peer_names = None
+    peer_names = raw_peer_names or {}
+
     cpu_millicores = linear(cpu_a, cpu_b, x)
     ram_mb         = linear(ram_a, ram_b, x)
     net_mbps       = linear(net_a, net_b, x)
@@ -119,6 +128,7 @@ def configure(payload: dict) -> None:
                 "net": {"a": net_a, "b": net_b},
             },
             "peers": peers,
+            "peer_names": peer_names,
         })
 
     metrics.TARGET_CPU.set(cpu_millicores)

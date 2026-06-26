@@ -26,10 +26,11 @@ merged by a federation layer later.
   (RAM, with a feedback nudger), and `iperf3` (per-peer network traffic).
 - **Two-phase materialisation** — pods are created first, then their real
   IPs are resolved and written back so iperf3 clients target concrete peers.
-- **Inter-tier latency** — an optional `latency` field declares RTTs between
-  tiers (e.g. `"edge": {"cloud": "100ms"}`); the controller renders and
-  reconciles Chaos Mesh `NetworkChaos` from it, re-resolving automatically
-  when pods churn, and tears it down with the template.
+- **Inter-tier latency / bandwidth** — optional `latency` / `bandwidth` fields
+  declare values between tiers (e.g. `"edge": {"cloud": "100ms"}`); the
+  controller shapes the inter-node links with `tc` (`htb` + `netem`) on each
+  tier node's NIC, so pods inherit them and scaling never disturbs the
+  injection. Torn down with the template.
 - **Observability** — workers export Prometheus gauges (target vs actual per
   resource, plus per-peer RTT); the controller fuses k8s state + live scrapes
   + Prometheus into the measurement endpoints, and serves a Grafana
@@ -47,7 +48,7 @@ merged by a federation layer later.
          Deployment+CM+Svc        Deployment+CM+Svc            Deployment+CM+Svc
           (role: gateway)          (role: api ×N)                 (role: db)
               worker pods  ◀── iperf3 peer traffic ──▶  worker pods
-                 │ /metrics scrape    (Chaos Mesh injects inter-tier latency)
+                 │ /metrics scrape    (tc on the tier nodes shapes inter-tier links)
                  ▼
           Prometheus ──▶ Grafana
 ```
@@ -67,11 +68,9 @@ merged by a federation layer later.
 - MicroK8s on a reachable host, with `metrics-server` enabled
 - Optional: a Prometheus Operator install (kube-prometheus-stack) for the
   PodMonitor and the windowed measurement endpoints
-- Optional: Chaos Mesh for inter-tier latency (the template's `latency`
-  field). On MicroK8s install it with the containerd socket override:
-  `helm install chaos-mesh chaos-mesh/chaos-mesh -n chaos-mesh
-  --create-namespace --set chaosDaemon.runtime=containerd
-  --set chaosDaemon.socketPath=/var/snap/microk8s/common/run/containerd.sock`
+- For inter-tier `latency` / `bandwidth`: run the controller on the host
+  (see `provision/`), where it shapes each tier VM's NIC with `tc` via
+  `multipass exec` — no Chaos Mesh required.
 
 ## Quick start
 
@@ -116,10 +115,6 @@ curl -X PATCH http://192.168.2.2:30081/template \
 curl -X DELETE http://192.168.2.2:30081/template
 ```
 
-You can also drive it declaratively — `kubectl apply` a ConfigMap labelled
-`emulator.local/template: "true"` and the controller's watcher materialises
-it. See [RUNBOOK.md](RUNBOOK.md).
-
 ## Project layout
 
 ```
@@ -131,12 +126,12 @@ cloud-native-emulator/
 │   ├── Dockerfile
 │   ├── app.py            FastAPI HTTP routes: /template CRUD + /graph + measurements
 │   ├── api.py            observability endpoints (overview / measurements)
-│   ├── chaos.py          Chaos Mesh integration: template-defined inter-tier
-│   │                     latency + automatic re-resolution after pod churn
+│   ├── linkspec.py       inter-tier latency/bandwidth validation + configured-RTT metric
+│   ├── netem.py          inter-tier link shaping (tc htb+netem on the tier nodes)
+│   ├── runner.py         scenario runner: steps x through runtime_scenarios on a clock
 │   ├── prom.py           Prometheus HTTP API client
 │   ├── graph.py          topology scrape + edge measurement
 │   ├── materialiser.py   template → k8s resources, two-phase create + IP resolve
-│   ├── watcher.py        reconciles labelled template ConfigMaps
 │   └── k8s.py            shared in-cluster k8s API client
 ├── worker/
 │   ├── Dockerfile
@@ -148,10 +143,8 @@ cloud-native-emulator/
 ├── manifests/
 │   ├── controller.yaml          ServiceAccount + RBAC + Pod + NodePort Service
 │   ├── worker-template.yaml      per-role blueprint, baked into the controller image
-│   ├── network-chaos.yaml        hand-applied inter-tier latency (legacy — prefer
-│   │                             the template's `latency` field)
 │   └── monitoring.yaml           PodMonitor for the templated worker pods
 ├── templates/                    ready-made topologies (iot-pipeline, smart-campus,
 │                                 retail-chain — the latter shows the latency field)
-└── grafana/                      dashboards incl. grafana-rtt.json (per-link RTT)
+└── grafana/                      dashboards incl. grafana-network.json (per-link latency + bandwidth)
 ```

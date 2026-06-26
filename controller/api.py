@@ -449,41 +449,44 @@ def _parse_duration(s: str) -> int:
                               "h": 3600, "d": 86400}[m.group(2) or "s"]
 
 
-def template_periods(name: str, start: datetime | None = None,
-                     end: datetime | None = None, chunk: str | None = None,
-                     resources=None) -> dict | None:
-    """Split [start, end] into consecutive FULL chunks of `chunk` each, and
-    aggregate each one separately.
+def template_periods(name: str, chunk: str | None = None,
+                     count: int | None = None, resources=None) -> dict | None:
+    """The last `count` chunks of `chunk` each, ending now, aggregated
+    separately.
 
-    Chunks are anchored at `start`; a trailing remainder shorter than `chunk`
-    is dropped and reported as remainder_s. Each period carries its own
-    start/end plus the same totals/roles/x blocks as template_range. Chunks
-    shorter than 30s (the Prometheus scrape interval) are rejected — they
-    would hold at most one sample.
+    e.g. count=4, chunk=11m → the last 44 minutes as 4 eleven-minute periods.
+    Each period carries its own start/end plus the same totals/roles/x blocks
+    as template_range. Chunks shorter than 30s (the Prometheus scrape
+    interval) are rejected — they would hold at most one sample.
 
     Returns None if no such template. Raises ValueError on a missing/bad
-    chunk, resources, or interval → caller maps to 400.
+    chunk or count → caller maps to 400.
     """
     info = materialiser.get_managed(name)
     if info is None:
         return None
     wanted = _wanted_resources(resources)
-    start_dt, end_dt, window_s = _resolve_interval(start, end)
 
     if not chunk:
         raise ValueError("chunk is required, e.g. chunk=10m")
     chunk_s = _parse_duration(chunk)
     if chunk_s < 30:
         raise ValueError("chunk must be >= 30s (the scrape interval)")
-    count = window_s // chunk_s
-    if count == 0:
-        raise ValueError(
-            f"chunk {chunk_s}s is longer than the {window_s}s range")
+
+    if count is None:
+        raise ValueError("count is required, e.g. count=4")
+    if count < 1:
+        raise ValueError("count must be >= 1")
     if count > _MAX_PERIODS:
         raise ValueError(
-            f"too many chunks ({count}, max {_MAX_PERIODS}) — use a larger "
-            "chunk or a narrower range")
-    remainder_s = window_s - count * chunk_s
+            f"too many chunks ({count}, max {_MAX_PERIODS}) — use a "
+            "larger chunk or a smaller count")
+    window_s = count * chunk_s
+    if window_s > _MAX_WINDOW_S:
+        raise ValueError(f"window too large: {window_s}s "
+                         f"(max {_MAX_WINDOW_S}s)")
+    end_dt = datetime.now(LOCAL_TZ)
+    start_dt = end_dt - timedelta(seconds=window_s)
 
     envelope = {
         "site": site_block(),
@@ -494,8 +497,6 @@ def template_periods(name: str, start: datetime | None = None,
         "chunk": f"{chunk_s}s",
         "count": count,
     }
-    if remainder_s:
-        envelope["remainder_s"] = remainder_s
     roles = (info.get("template") or {}).get("roles") or {}
 
     if not prom.available():

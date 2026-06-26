@@ -63,7 +63,7 @@ surgical changes prefer `PATCH /template`.
 | `x` | number | yes | The signal that drives the topology. Sources use it directly; downstream roles use the resolved cascade |
 | `roles` | object | yes | Map of `role_name → role_spec`. See below |
 | `edges` | array | optional | List of `{"from": role, "to": role}` |
-| `latency` | object | optional | Inter-tier RTTs, applied via Chaos Mesh. See "Inter-tier latency" below |
+| `latency` | object | optional | Inter-tier one-way latency, applied as `tc` shaping on the tier nodes. See "Inter-tier latency" below |
 
 **Role spec:**
 
@@ -71,6 +71,7 @@ surgical changes prefer `PATCH /template`.
 {
   "count": 2,
   "tier": "edge",
+  "node": "site-edge-01-1",
   "cpu": {"a": 0, "b": 100},
   "ram": {"a": 0, "b": 128},
   "net": {"a": 0.2, "b": 0}
@@ -82,6 +83,16 @@ the resolved x for that role (see "x propagation" below). `tier` is optional
 and pins the role's pods to nodes labelled `tier=<value>` (e.g.
 edge / fog / cloud); absent = schedule anywhere.
 
+`node` is optional and pins the role's pods to **one specific node** by name
+(its `kubernetes.io/hostname`, which equals the node/VM name) via
+`nodeSelector: {kubernetes.io/hostname: <node>}`. If combined with `tier` the
+node must belong to that tier, else the pods stay `Pending`. All replicas of a
+node-pinned role co-locate on that node. Change it live to **move** a
+deployment — `PATCH {"roles.<role>.node": "site-edge-01-1"}` reschedules onto
+that node; `PATCH {"roles.<role>.node": ""}` unpins it back to tier-level
+placement. In the topology schema, set it per deployment as
+`k8s_app_description[].node_name`.
+
 **Inter-tier latency:**
 
 ```json
@@ -91,18 +102,24 @@ edge / fog / cloud); absent = schedule anywhere.
 }
 ```
 
-Each value is the **round-trip time** you want between pods of the two
-tiers; the controller renders one Chaos Mesh `NetworkChaos` per pair (half
-the RTT injected on egress at each end), reconciles them on every
-materialise (including re-resolving after pod churn), and removes them on
-DELETE. Pairs are symmetric — give each once, in either orientation.
-Durations accept `us` / `ms` / `s`; same-tier pairs, duplicate pairs, and
-RTTs above 10s are rejected with a 400. Requires Chaos Mesh installed
-(skipped with a log warning otherwise); when present, remove any
-hand-applied `manifests/network-chaos.yaml` or the delays stack. Retune
-live with a dot-path PATCH: `{"latency.edge.fog": "50ms"}`. Measured RTTs
-are visible per link via the `worker_peer_rtt_ms` gauge
-(`grafana/grafana-rtt.json`).
+Each value is the **one-way latency** you want between pods of the two
+tiers — `"edge": {"fog": "30ms"}` means a packet takes 30ms edge→fog (and
+30ms fog→edge, since latency is symmetric). The controller applies it as
+**link-level `tc` shaping on the nodes** (`controller/netem.py`): an `htb`
+class + `netem` delay on each tier node's NIC, matched on the **peer tier's
+node IP**, injecting the **full** value on each direction (so a round trip is
+~2× it). Because the rule lives on the inter-node link, pods inherit it
+automatically — scaling a tier never disturbs it. Reconciled on every
+materialise and removed on DELETE. Pairs are symmetric — give each once, in
+either orientation. Durations accept `us` / `ms` / `s`; same-tier pairs,
+duplicate pairs, and values above 10s are rejected with a 400. Requires the
+controller to run on the host with `multipass` access to the nodes (no Chaos
+Mesh needed). Retune live with a dot-path PATCH: `{"latency.edge.fog":
+"50ms"}`. The measured one-way value is visible per link as
+`worker_peer_rtt_ms / 2` (the TCP round-trip halved) in the Latency section
+of `grafana/grafana-network.json`, next to the configured
+`emulator_configured_one_way_ms`; measured throughput per link is in that
+dashboard's Bandwidth section (`worker_peer_egress_mbps`).
 
 **Example:**
 
@@ -188,9 +205,9 @@ curl -X PATCH http://192.168.2.2:30081/template -d '{"latency.edge.cloud": "150m
 
 ## `DELETE /template`
 
-Tear down every resource for the materialised template. Template-defined
-latency chaos is removed first (while the worker pods are still alive, so
-Chaos Mesh's cleanup is fast), then Deployments, Services, and ConfigMaps.
+Tear down every resource for the materialised template. Inter-tier link
+shaping (`tc` on the tier nodes) is removed first, along with any leftover
+Chaos Mesh `NetworkChaos`, then Deployments, Services, and ConfigMaps.
 
 ```bash
 curl -X DELETE http://192.168.2.2:30081/template
@@ -357,23 +374,24 @@ alternative.
 
 ## `GET /measurements/periods`
 
-The same interval **split into consecutive equal chunks**, each aggregated
+The **last `count` chunks of `chunk` each, ending now**, aggregated
 separately — for seeing how the numbers move over a run rather than one
 flattened average.
 
-**Query params:** `start`, `end`, `resources` as above, plus:
+**Query params:** `resources` as above, plus:
 
 | Param | Required | Notes |
 |-------|----------|-------|
+| `count` | yes | How many chunks to return, counting back from now |
 | `chunk` | yes | Length of each chunk, e.g. `90s`, `10m`, `1h` (min `30s`, the scrape interval) |
 
-The range is split into as many **full** chunks of `chunk` as fit, anchored
-at `start`; a trailing remainder shorter than `chunk` is dropped and
-reported as `remainder_s`.
+You say how many chunks and how long each one is; the range is exactly
+`count × chunk`, ending now. e.g. `count=4&chunk=11m` → the last 44 minutes
+as 4 eleven-minute periods.
 
 ```bash
-# A one-hour run sliced into 10-minute periods
-curl -s "http://192.168.2.2:30081/measurements/periods?start=2026-06-10T11:00:00&end=2026-06-10T12:00:00&chunk=10m" \
+# The last 44 minutes as 4 eleven-minute periods
+curl -s "http://192.168.2.2:30081/measurements/periods?count=4&chunk=11m" \
   | python3 -m json.tool
 ```
 
@@ -381,8 +399,8 @@ curl -s "http://192.168.2.2:30081/measurements/periods?start=2026-06-10T11:00:00
 ```json
 {
   "timestamp": "…", "site": {"…": "…"}, "name": "<name>",
-  "start": "…", "end": "…", "window": "3600s",
-  "chunk": "600s", "count": 6,
+  "start": "…", "end": "…", "window": "2640s",
+  "chunk": "660s", "count": 4,
   "periods": [
     {"start": "…", "end": "…",
      "totals": {"…": "…"}, "roles": {"…": "…"},
@@ -392,8 +410,8 @@ curl -s "http://192.168.2.2:30081/measurements/periods?start=2026-06-10T11:00:00
 }
 ```
 
-**Errors:** `400` for a missing/malformed `chunk`, a chunk longer than the
-range, or more than 100 chunks. `404` if nothing is materialised.
+**Errors:** `400` for a missing/malformed `chunk` or `count`, or more than
+100 chunks. `404` if nothing is materialised.
 
 ## `GET /graph`
 
@@ -446,37 +464,6 @@ gauge.
 
 ---
 
-## Declarative ingestion (no HTTP needed)
-
-The controller also reconciles ConfigMaps labelled
-`emulator.local/template: "true"`. A polling watcher
-(`controller/watcher.py`, 10s interval) calls into the same
-`materialise()` / `teardown()` codepaths used by `POST` and `DELETE`.
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: <name>
-  labels:
-    emulator.local/template: "true"
-data:
-  template.json: |
-    {"x": 10, "roles": { ... }, "edges": [ ... ]}
-```
-
-```bash
-microk8s kubectl apply -f <name>-template.yaml   # materialises within ~15s
-microk8s kubectl edit configmap <name>           # live edit → re-materialise
-microk8s kubectl delete configmap <name>         # tears the topology down
-```
-
-The template's `name` comes from `metadata.name`; any `name` inside
-`template.json` is overwritten. HTTP- and watch-created templates carry a
-`source` annotation and the watcher only tears down templates it created.
-
----
-
 # Worker
 
 Workers expose three endpoints on port `8080`. They're not exposed via
@@ -524,8 +511,8 @@ Prometheus text-format scrape endpoint. Gauges exposed:
 | `worker_actual_ram_mb` | cgroup working set (matches cAdvisor / Grafana) |
 | `worker_actual_net_mbps` | 15s rolling egress rate from `psutil.net_io_counters` |
 | `worker_cpu_stress_millicores` | CPU the feedback loop currently asks stress-ng to generate |
-| `worker_peer_egress_mbps{peer}` | Measured egress to a specific peer IP (from iperf3 interval reports) |
-| `worker_peer_rtt_ms{peer}` | TCP-handshake RTT to a peer pod, probed every 15s — includes injected inter-tier latency |
+| `worker_peer_egress_mbps{peer,peer_name}` | Measured egress to a specific peer IP (from iperf3 interval reports). `peer` is the pod IP; `peer_name` is the destination role |
+| `worker_peer_rtt_ms{peer,peer_name}` | TCP-handshake RTT to a peer pod, probed every 15s — includes injected inter-tier latency. `peer` is the pod IP; `peer_name` is the destination role |
 
 All gauges are scraped via the PodMonitor in `manifests/monitoring.yaml`.
 
@@ -553,7 +540,7 @@ curl -s http://localhost:8080/metrics | grep -E "^worker_"
 | GET | `/overview` | Site-wide snapshot (subsumes `/health`) |
 | GET | `/measurements/now` | Live per-role state + gauges + edges |
 | GET | `/measurements/range` | CPU/RAM/net aggregated over `?start`–`?end` |
-| GET | `/measurements/periods` | The range split into `?chunk`-sized periods |
+| GET | `/measurements/periods` | The last `?count` chunks of `?chunk` each, ending now |
 | GET | `/graph` | Grafana Node Graph payload (`?view=role\|pods`) |
 | GET | `/docs`, `/openapi.json` | Swagger UI (dark) and the generated spec |
 

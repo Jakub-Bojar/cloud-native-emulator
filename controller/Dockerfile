@@ -15,12 +15,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY controller/app.py          /app/app.py
 COPY controller/api.py          /app/api.py
-COPY controller/chaos.py        /app/chaos.py
 COPY controller/graph.py        /app/graph.py
 COPY controller/k8s.py          /app/k8s.py
+COPY controller/linkspec.py     /app/linkspec.py
 COPY controller/materialiser.py /app/materialiser.py
+COPY controller/netem.py        /app/netem.py
 COPY controller/prom.py         /app/prom.py
-COPY controller/watcher.py      /app/watcher.py
+COPY controller/runner.py       /app/runner.py
 
 # The blueprint stencil. materialiser.py reads this at runtime and
 # substitutes per-role placeholders before POSTing to the k8s API.

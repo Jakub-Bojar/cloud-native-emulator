@@ -16,9 +16,8 @@ ASCII (paste-anywhere fallback).
 ## 1. System overview
 
 The big picture. One controller pod plus N×role-count worker pods, all
-in the `cloud-native-emulator` namespace. The controller has two
-ingestion paths (HTTP and labelled-ConfigMap watch) that funnel into a
-single materialiser.
+in the `cloud-native-emulator` namespace. Topologies are ingested over
+HTTP (`POST /template`) into a single materialiser.
 
 ### Mermaid
 
@@ -28,9 +27,7 @@ flowchart TB
 
     subgraph cluster["Kubernetes Cluster"]
         subgraph ns["cloud-native-emulator namespace"]
-            Controller["<b>Controller Pod</b><br/>HTTP API · 10s Watcher · Materialiser · x Propagator"]
-
-            LCM[("Labelled ConfigMaps<br/>label: emulator.local/template=true")]
+            Controller["<b>Controller Pod</b><br/>HTTP API · Materialiser · x Propagator · Scenario Runner"]
 
             subgraph roleRes["Per-role resources (× N roles)"]
                 direction LR
@@ -54,8 +51,6 @@ flowchart TB
     end
 
     User -->|"POST/PATCH/DELETE /template"| Controller
-    User -->|"kubectl apply"| LCM
-    LCM -.->|"10s poll"| Controller
     Controller -->|"create / patch"| K8sAPI
     K8sAPI -.->|owns| CM
     K8sAPI -.->|owns| Deploy
@@ -71,8 +66,8 @@ flowchart TB
                     ┌─────────────┐
                     │ User / CI   │
                     └──────┬──────┘
-       curl POST/PATCH/    │           kubectl apply
-       DELETE /template    │           (labelled CM)
+       curl POST/PATCH/    │
+       DELETE /template    │
                            ▼
    ┌───────────────────────────────────────────────────────────────┐
    │                                                               │
@@ -80,9 +75,9 @@ flowchart TB
    │                  │     Controller Pod       │                 │
    │                  │  ┌────────────────────┐  │                 │
    │                  │  │ HTTP API (8081)    │  │                 │
-   │                  │  │ ConfigMap Watcher  │◀─┼──── 10s poll    │
    │                  │  │ Materialiser       │  │                 │
    │                  │  │ x-Propagator       │  │                 │
+   │                  │  │ Scenario Runner    │  │                 │
    │                  │  └─────────┬──────────┘  │                 │
    │                  └────────────┼─────────────┘                 │
    │                               │                               │

@@ -23,9 +23,8 @@ from the cgroup working set).
 
 import logging
 import re
-import urllib.error
-import urllib.request
 
+import k8s
 import materialiser
 
 log = logging.getLogger(__name__)
@@ -58,17 +57,22 @@ _NODE_GAUGES = (
 )
 
 
-def _scrape_pod(ip: str) -> dict | None:
-    """Scrape one worker's /metrics. Returns a dict of the bare gauges plus a
-    `peer_egress` sub-dict {peer_ip: mbps}, or None if the pod is unreachable.
-    """
-    url = f"http://{ip}:{WORKER_PORT}/metrics"
-    try:
-        with urllib.request.urlopen(url, timeout=SCRAPE_TIMEOUT) as resp:
-            text = resp.read().decode()
-    except (urllib.error.URLError, OSError) as e:
-        log.warning("graph: scrape %s failed: %s", ip, e)
+def _scrape_pod(pod_name: str, ip: str) -> dict | None:
+    """Scrape one worker's /metrics via the apiserver proxy. Returns a dict of
+    the bare gauges plus a `peer_egress` sub-dict {peer_ip: mbps}, or None if
+    the pod is unreachable.
+
+    Goes through the apiserver pod-proxy (`/pods/<name>:<port>/proxy/metrics`)
+    rather than the pod IP directly, so it works both in-cluster and from the
+    host (where the Calico pod network isn't routable)."""
+    ns = k8s.namespace()
+    path = (f"/api/v1/namespaces/{ns}/pods/"
+            f"{pod_name}:{WORKER_PORT}/proxy/metrics")
+    status, body = k8s.get(path)
+    if status != 200:
+        log.warning("graph: scrape %s (%s) failed: status=%s", pod_name, ip, status)
         return None
+    text = body.decode()
     out: dict = {"peer_egress": {}}
     for line in text.splitlines():
         if not line or line.startswith("#"):
@@ -131,7 +135,7 @@ def scrape_topology(name: str) -> dict | None:
     pod_records: list[dict] = []
     for role, pods in role_pods.items():
         for pod_name, ip in pods:
-            s = _scrape_pod(ip) or {"peer_egress": {}}
+            s = _scrape_pod(pod_name, ip) or {"peer_egress": {}}
             pod_records.append({"role": role, "pod": pod_name, "ip": ip, **s})
 
     # Assign a palette colour per role by position so one graph never reuses a

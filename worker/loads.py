@@ -34,11 +34,18 @@ import time
 
 from state import (CPU_LOAD_SLICE_MS, IPERF_BASE_PORT, IPERF_PORT_COUNT,
                    IPERF_SERVER_RECYCLE_INTERVAL_S,
-                   IPERF_SERVER_RECYCLE_GRACE_S,
+                   IPERF_SERVER_RECYCLE_GRACE_S, IPERF_UDP_LEN,
                    PAGE_SIZE, STATE, STATE_LOCK,
                    PEER_EGRESS_MBPS, PEER_EGRESS_LOCK)
 
 log = logging.getLogger(__name__)
+
+# Net-load transport. UDP (the default) sends at exactly the requested rate
+# regardless of latency — a TCP stream is capped by window/RTT, so on a
+# latency-injected link it can't reach the target rate and the actual egress
+# undershoots (CPU/RAM are local and unaffected, which is why only net lagged).
+# UDP has no such ceiling. Set NET_PROTOCOL=tcp to fall back to TCP.
+NET_USE_UDP = os.environ.get("NET_PROTOCOL", "udp").strip().lower() != "tcp"
 
 PROCS: list[subprocess.Popen] = []
 RAM_BUFFER: mmap.mmap | None = None
@@ -264,12 +271,25 @@ def _peer_client_supervisor(peer: str, mbps_per_peer: float,
     cmd = [
         "iperf3", "-c", host,
         "-p", str(port),
-        "-b", f"{mbps_per_peer}M",
+        "-b", f"{mbps_per_peer}M",    # target rate; for UDP this IS the send rate
         "-t", "86400",                # iperf3's hard cap (24h)
         "--connect-timeout", "3000",  # ms; fail fast so the loop can retry
         "-i", "1",                    # one interval report per second
         "--forceflush",               # flush each report so we can read it live
     ]
+    if NET_USE_UDP:
+        # UDP sends at -b without waiting for ACKs, so injected latency doesn't
+        # throttle it (mbps_per_peer is always > 0 here — start_network returns
+        # early for the mbps==0 case — so -u never means "unlimited").
+        cmd.append("-u")
+        # Bigger UDP datagrams carry the same Mbps in far fewer sendmsg() calls,
+        # so the per-call CPU cost (which dominates a net-heavy pod's CPU floor)
+        # drops sharply. The kernel IP-fragments over-MTU datagrams, so the wire
+        # and the bandwidth shaping see MTU-sized packets either way — only the
+        # userspace syscall rate changes. See state.IPERF_UDP_LEN; "" / "0" keeps
+        # iperf3's default.
+        if IPERF_UDP_LEN and IPERF_UDP_LEN not in ("0", ""):
+            cmd += ["-l", IPERF_UDP_LEN]
     while not stop.is_set():
         log.info("peer iperf3 spawn: %s", shlex.join(cmd))
         try:

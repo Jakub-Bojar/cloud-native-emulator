@@ -1,8 +1,8 @@
 # Runbook
 
 Operational reference for the cloud-native emulator: build, deploy, drive,
-observe, debug, and tear down. Two ingestion paths (HTTP + declarative)
-share one materialiser; both are covered here.
+observe, debug, and tear down. Topologies are ingested over HTTP
+(`POST /template`).
 
 Run everything from the repo root. Replace `jp36` with your Docker Hub
 username and `192.168.2.2` with your MicroK8s host IP throughout. Pods
@@ -21,10 +21,10 @@ live in the `cloud-native-emulator` namespace by default — add
 - A Prometheus Operator installation if you want the `PodMonitor` in
   `manifests/monitoring.yaml` to be picked up (otherwise the workers'
   annotations let plain Prometheus scrape them via service discovery)
-- Optional: Chaos Mesh, if you use the template's `latency` field for
-  inter-tier delay. On MicroK8s, install with the containerd socket
-  override (`--set chaosDaemon.runtime=containerd --set
-  chaosDaemon.socketPath=/var/snap/microk8s/common/run/containerd.sock`)
+- For the template's `latency` / `bandwidth` fields (inter-tier delay /
+  rate): the controller must run on the host (see `provision/`), where it
+  shapes each tier VM's NIC with `tc` via `multipass exec`. No Chaos Mesh
+  needed.
 
 ---
 
@@ -95,9 +95,7 @@ curl -X DELETE http://192.168.2.2:30081/template
 
 ---
 
-## Drive the system — two modes
-
-### Mode A: HTTP template (most flexible)
+## Drive the system
 
 A controller manages **one** template, so the routes are singular and take
 no name. POSTing a different name while one exists returns `409` — DELETE
@@ -125,37 +123,6 @@ curl -X DELETE http://192.168.2.2:30081/template
 
 The response from POST returns the resolved peer map (Service names) and
 the role counts; verify it matches what you intended before walking away.
-
-### Mode B: Declarative — kubectl apply a labelled ConfigMap
-
-```yaml
-# fb-template.yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: fb
-  labels:
-    emulator.local/template: "true"     # the watcher's marker
-data:
-  template.json: |
-    {
-      "x": 10,
-      "roles": {
-        "frontend": {"count": 1, "cpu":{"a":10,"b":100}, "ram":{"a":2,"b":32}, "net":{"a":0.2,"b":2}},
-        "backend":  {"count": 2, "cpu":{"a":5,"b":50},  "ram":{"a":1,"b":16}, "net":{"a":0.1,"b":1}}
-      },
-      "edges": [{"from":"frontend","to":"backend"}]
-    }
-```
-
-```bash
-microk8s kubectl apply -f fb-template.yaml      # materialises within ~15s
-microk8s kubectl edit configmap fb              # live edit → watcher re-materialises
-microk8s kubectl delete configmap fb            # watcher tears down entire topology
-```
-
-The template's `name` comes from `metadata.name`. Any `name` field inside
-`template.json` is overwritten by the watcher.
 
 ---
 
@@ -197,10 +164,6 @@ curl -X PATCH http://192.168.2.2:30081/template \
 After a scale-up, `/measurements/now` shows new pods with empty
 `metrics: {}` until they become Ready and land in Endpoints — watch them
 fill in there.
-
-> If the template's `source == "watch"`, the ConfigMap watcher will
-> revert a PATCH within ~10s. Edit the labelled ConfigMap's `count`
-> instead (Mode B) for a sticky change.
 
 > The windowed `/measurements/range` and `/periods` need Prometheus
 > reachable at `PROM_URL`. If it isn't, they still return 200 with
@@ -261,11 +224,9 @@ These are the exact checks used during system validation.
 ```bash
 microk8s kubectl logs controller --tail=20
 # Look for:
-#   ConfigMap watcher: polling every 10.0s for labelled ConfigMaps
+#   Controller started
 #   Controller listening on 0.0.0.0:8081
 ```
-
-If the watcher line is missing, you're on a pre-Step-6 image — rebuild.
 
 ### Inspect a materialised template
 
@@ -325,14 +286,6 @@ microk8s kubectl logs deployment/wt-<name>-<role> | head -30
 #   spawn: iperf3 -s -p 9999          (and one per IPERF_PORT_COUNT)
 #   Configuring x=… peers=[…]         (Phase 2 reconfigure)
 #   Sampler heartbeat                 (every 30s)
-```
-
-### Confirm sources don't fight (HTTP + Watch coexistence)
-
-```bash
-curl -s http://192.168.2.2:30081/overview | python3 -m json.tool   # lists templates + source
-curl -s http://192.168.2.2:30081/template | python3 -m json.tool
-# the /overview entry carries "source": "http"  or  "source": "watch"
 ```
 
 ---
@@ -411,10 +364,6 @@ microk8s kubectl get podmonitor      # expect: worker AND worker-templates
 # The materialised template (one per controller)
 curl -X DELETE http://192.168.2.2:30081/template
 
-# Plus any labelled CMs the watcher would otherwise pick up again
-microk8s kubectl get configmap -l emulator.local/template=true -o name \
-  | xargs -r microk8s kubectl delete
-
 # Belt-and-braces: anything still labelled as ours
 microk8s kubectl delete all,configmap -l app.kubernetes.io/managed-by=emulator-controller
 ```
@@ -458,9 +407,9 @@ microk8s kubectl delete -f manifests/monitoring.yaml
 - **Endpoint enumeration is one-shot.** Phase 2 reads pod IPs at
   materialise time. If backend pods restart (e.g. rollout, eviction),
   their new IPs aren't propagated — re-POST or re-apply the template.
-  (Inter-tier latency has the same hazard but self-heals: the controller
-  re-resolves the Chaos Mesh rules on every materialise — see
-  `controller/chaos.py`.)
+  (Inter-tier latency/bandwidth has no such hazard: it's shaped on the
+  tier *nodes* by IP-independent `tc` rules, so pod churn never disturbs
+  it — see `controller/netem.py`.)
 - **Template formulas must conserve traffic** (see "Template authoring"
   above). The materialiser doesn't validate conservation.
 - **`microk8s kubectl exec --`** is broken by the wrapper. Use
@@ -474,11 +423,12 @@ microk8s kubectl delete -f manifests/monitoring.yaml
 controller/
   app.py            FastAPI HTTP routes: /template CRUD + /graph + observability
   api.py            observability: overview + measurements (k8s + scrape + prom)
-  chaos.py          Chaos Mesh: template-defined latency + auto re-resolve on churn
+  linkspec.py       inter-tier latency/bandwidth validation + configured-RTT metric
+  netem.py          inter-tier link shaping (tc htb+netem on the tier nodes)
+  runner.py         scenario runner: steps x through runtime_scenarios on a clock
   prom.py           Prometheus HTTP API client (instant queries), graceful
   graph.py          topology scrape + edge measurement (shared by /graph + api)
   materialiser.py   template → resources, two-phase create + IP resolve
-  watcher.py        polls labelled CMs, reconciles via materialiser
   k8s.py            shared k8s API client
   Dockerfile        builds from REPO ROOT (needs manifests/)
 worker/
